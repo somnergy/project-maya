@@ -2583,7 +2583,13 @@ static int glm_pack_generate(const Options& o) {
         std::vector<strata::kernels::SamplerParams> sps;
         bool back = false;
     };
+    bool step_no_spec = false;   // (between a prompt's pieces: the speculative stint runs until input comes - not there)
     std::deque<WinGroup> wflight;
+    // (the drafts as the NextN block's batched rows bind nothing: they run in a prompt read's decode gaps and between
+    // its pieces too; STRATA_GLM_MULTI_MTP_DRAFT_ROWS=0 drafts with the last part bound to each request - not while a
+    // read keeps its context bound: those windows go without drafts)
+    static const bool draft_rows = env_num("STRATA_GLM_MULTI_MTP_DRAFT_ROWS", 1) != 0;
+    const auto may_draft = [&] { return draft_rows || (!in_read_gap && !step_no_spec); };
     const auto win_back = [&](WinGroup& w) -> bool {
         if (w.back) return true;
         w.back = true;
@@ -2593,7 +2599,7 @@ static int glm_pack_generate(const Options& o) {
     // written before it (T lines, the stop conditions, a forced token - gen_took's rules); the commit; then the next
     // windows' drafts - the next group's last part is queued between the drafts and their wait, so the last GPU goes
     // on with it; the requests that ended, ended
-    const auto win_take = [&]() -> bool {
+    const auto win_take = [&](bool draft) -> bool {
         WinGroup w = std::move(wflight.front());
         wflight.pop_front();
         const int n = (int) w.seqs.size();
@@ -2646,10 +2652,11 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (!model.mtpw_commit(w.seqs.data(), w.counts.data(), keep.data(), n, err)) return false;
-        if (!model.mtpw_draft_queue(w.seqs.data(), keep.data(), n, written.data(), last.data(), nd.data(), err))
+        if (draft && !model.mtpw_draft_queue(w.seqs.data(), keep.data(), n, written.data(), last.data(), nd.data(),
+                                             err))
             return false;
         if (!wflight.empty() && !win_back(wflight.front())) return false;
-        {
+        if (draft) {
             std::vector<int32_t> out((size_t) n * (size_t) std::max(1, D), -1);
             if (!model.mtpw_draft_take(out.data(), err)) return false;
             for (int i = 0; i < n; ++i) {
@@ -2669,7 +2676,7 @@ static int glm_pack_generate(const Options& o) {
     // every issued token back (before a prompt, a boundary or the speculative path)
     const auto multi_drain = [&]() -> bool {
         while (!wflight.empty())
-            if (!win_take()) return false;
+            if (!win_take(may_draft())) return false;
         while (!flight.empty()) {
             Gen& g = *flight.front();
             flight.pop_front();
@@ -2960,7 +2967,6 @@ static int glm_pack_generate(const Options& o) {
     };
     // one step of the scheduler: a stint of the speculative path for a request alone, else one token back from the
     // pipelined decode (and every request with a token to feed issued first).  Errors end the running requests.
-    bool step_no_spec = false;   // (between a prompt's pieces: the speculative stint runs until input comes - not there)
     const auto multi_step = [&] {
         std::vector<float> lg;
         // (a PAUSE in the last read's gaps: its snapshot, once no request waits for its first token)
@@ -3077,11 +3083,11 @@ static int glm_pack_generate(const Options& o) {
                 gen_sweep();
                 return;
             }
-            if (!win_take()) {
+            if (!win_take(may_draft())) {
                 multi_fail(err);
                 return;
             }
-            if (multi_boundary_every > 0 &&
+            if (multi_boundary_every > 0 && !in_read_gap &&
                 since_boundary >= multi_boundary_every * (int) std::max<size_t>(1, gens.size())) {
                 since_boundary = 0;
                 if (!multi_drain() || !model.multi_boundary(err)) {
@@ -3253,8 +3259,11 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
         }
+        // (drained while step_no_spec still holds: no per-request draft steps - they bind the last part - between a
+        // prompt's pieces)
+        const bool drained = multi_drain();
         step_no_spec = false;
-        if (!multi_drain()) {
+        if (!drained) {
             multi_fail(err);
             return failed();
         }
