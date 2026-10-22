@@ -106,6 +106,16 @@ constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
+// the shortest call that prestages (STRATA_GLM_PRESTAGE_MIN_T, 256 at least; default kPreMinT): from ~512 tokens a
+// chunk routes nearly every expert of a layer, so a short read on a split - an agent's turn - can prestage too
+static int pre_min_t() {
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_PRESTAGE_MIN_T");
+        const int x = e != nullptr ? std::atoi(e) : kPreMinT;
+        return x >= 256 ? x : kPreMinT;
+    }();
+    return v;
+}
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
@@ -1541,7 +1551,7 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->w32 = c.take<float>((size_t) S->w32_elems);
     S->ws = c.take<uint8_t>(S->ws_bytes);
     S->gbuf = S->gbuf_bytes ? c.take<uint8_t>(S->gbuf_bytes) : nullptr;
-    S->pbuf = S->pbuf_bytes && Tn >= kPreMinT ? c.take<uint8_t>(S->pbuf_bytes) : nullptr;   // (a short prompt: none)
+    S->pbuf = S->pbuf_bytes && Tn >= pre_min_t() ? c.take<uint8_t>(S->pbuf_bytes) : nullptr;   // (a short prompt: none)
     Carve a{S->arena};
     S->R = a.take<float>(T * 4 * E);
     S->x = a.take<float>(T * E);
@@ -2267,7 +2277,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const auto prestage = [&](int il) {
         S->pre_layer = -1;
         S->pre_e.clear();
-        if (S->pbuf == nullptr || T < kPreMinT || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
+        if (S->pbuf == nullptr || T < pre_min_t() || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
             (tail_skip && il == g.n_layers - 1))   // the skipped terminal FFN reads no experts
             return;
         const auto& Ly = F->L[(size_t) il];
