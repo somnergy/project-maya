@@ -235,6 +235,17 @@ int main() {
                "gap due: a 20% budget of a 400 ms stage is half a 200 ms round, 300 ms is not");
         expect(!prefill_gap_due(prefill_gaps_parse("0"), 1e6, 0.0), "gap due: never with gaps off");
     }
+    // the EXL3 switch by chunk length (STRATA_GLM_EXL3_MMA_ROWS_SHORT)
+    {
+        using namespace strata::core;
+        const MmaRowsShort off = mma_rows_short_parse(nullptr), on = mma_rows_short_parse("192"),
+                           at = mma_rows_short_parse("256,2048");
+        expect(off.rows == 0 && mma_rows_short_parse("0").rows == 0, "mma short: unset / 0 off");
+        expect(on.rows == 192 && on.max_tokens == 4096 && at.rows == 256 && at.max_tokens == 2048, "mma short: parse");
+        expect(mma_rows_for(1024, 64, off) == 64 && mma_rows_for(1024, 64, on) == 192 && mma_rows_for(4096, 64, on) == 192 &&
+                   mma_rows_for(4097, 64, on) == 64 && mma_rows_for(0, 64, on) == 64 && mma_rows_for(3000, 64, at) == 64,
+               "mma short: short chunks only");
+    }
     if (fails == 0) std::printf("prefill_pieces_test: all passed\n");
     return fails == 0 ? 0 : 1;
 }
