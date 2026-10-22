@@ -274,6 +274,15 @@ public:
     bool vision_lend(size_t& bytes, std::string& err);
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
+    /// STRATA_GLM_MTP_LEND=1 (src/core/glm_mtp_lend.cu, strata/core/mtp_lend.hpp): the NextN draft layer's main expert
+    /// slots serve the last part's trunk layers as borrowed slots while drafting is off.  mtp_lend_ready(): set up on
+    /// this split; mtp_lent(): lent now (no drafting: spec_ready() is false and the scheduler's windows wait);
+    /// mtp_lend_switch(true) lends them, (false) takes them back - every part idle (after the scheduler's drain).
+    /// `why` goes into the log line.  A switch that fails turns lending off for the run (mtp_lend_ready() false) with
+    /// the slots counted as lent (no drafting).
+    bool mtp_lend_ready() const;
+    bool mtp_lent() const;
+    bool mtp_lend_switch(bool lend, const std::string& why, std::string& err);
     int32_t forced(int32_t sampled) {
         int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
@@ -1018,9 +1027,15 @@ public:
     // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
     static int pool_keep(int n_exp_used);
-    bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
+    bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err, bool borrowed = false);
     // the tail slots' addresses in the pool's tail region (xbase / xstep of each layer; STRATA_GLM_LEND_SPREAD)
     void tail_layout(uint8_t* region);
+    // STRATA_GLM_MTP_LEND (src/core/glm_mtp_lend.cu): fast_setup's borrowed slots (share: the pool split's routing
+    // shares, empty without them), the pinned copy's release, and this part's switch
+    bool mtp_lend_setup(const std::vector<std::vector<double>>& share, std::string& err);
+    void mtp_lend_free();
+    bool mtp_lend_part(bool lend, const std::string& why, std::string& err);
+    bool mtp_lend_step_(bool lend, const std::string& why, std::string& err);   // (mtp_lend_part's body)
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)
     // this half's layers over a chunk (rows in pf_->R); next_ids / next_img: the NextN block's next tokens and, where
