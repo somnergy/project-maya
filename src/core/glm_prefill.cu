@@ -1658,7 +1658,7 @@ bool Glm5Model::vision_reclaim(std::string& err) {
         std::lock_guard<std::mutex> lk(F->mu);
         for (int il = l0_; il < lt_; ++il) {
             auto& P = F->lp[(size_t) il];
-            for (int s = P.n_main; s < P.n; ++s)
+            for (int s = P.n_main; s < P.n_tail; ++s)
                 if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
         }
     }
@@ -1670,7 +1670,8 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 
 // The tail's slots below xpool + limit leave the decode: a resident expert takes the slot of a colder main-slot
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
-bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
+// borrowed (STRATA_GLM_MTP_LEND's reclaim): the same for every borrowed slot [n_tail, n) instead (limit unused).
+bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err, bool borrowed) {
     FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
@@ -1683,7 +1684,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         return false;
     }
     const int NE = g_.n_expert;
-    F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
+    if (!borrowed) F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
     {
         std::lock_guard<std::mutex> lk(F->mu);
         int nu = 0;
@@ -1770,9 +1771,9 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
             });
             size_t ci = 0;
-            for (int s = P.n_main; s < P.n; ++s) {
+            for (int s = borrowed ? P.n_tail : P.n_main; s < (borrowed ? P.n : P.n_tail); ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) {
+                if (!borrowed && P.slot_ptr(s) >= F->xpool + limit) {
                     // ... and it is the first live byte of this layer's tail: what precedes it is a loan nobody uses
                     F->lend_end = std::min(F->lend_end, (size_t) P.slot_ptr(s));
                     continue;
@@ -1837,7 +1838,7 @@ bool Glm5Model::prefill_return(std::string& err) {
     std::lock_guard<std::mutex> lk(F->mu);
     for (int il = l0_; il < lt_; ++il) {
         auto& P = F->lp[(size_t) il];
-        for (int s = P.n_main; s < P.n; ++s)
+        for (int s = P.n_main; s < P.n_tail; ++s)
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;

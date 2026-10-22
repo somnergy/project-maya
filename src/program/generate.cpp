@@ -47,6 +47,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/mtp_lend.hpp"
 #include "strata/core/split_groups.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
@@ -2301,6 +2302,14 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm multi mtp: the running requests verify up to %d drafts each in their batched steps "
                              "(%d rows a group)\n", strata::core::Glm5Model::multi_mtp_setting(),
                      strata::core::Glm5Model::rows_max());
+    // STRATA_GLM_MTP_LEND: the draft layer's expert slots serve the trunk while drafting is off (strata/core/mtp_lend.hpp:
+    // when; src/core/glm_mtp_lend.cu: how) - the switch at a scheduler step, every issued token back first
+    const bool mtp_lend = mtp_rows && model.mtp_lend_ready();
+    if (multi && strata::core::mtp_lend_policy().on && !mtp_lend)
+        std::fprintf(stderr, "glm mtp lend: MAYA_GLM_MTP_LEND is set but not used here - it needs MAYA_GLM_MULTI_MTP's "
+                             "windows on a split, with the draft layer's slots set up (see the start log)\n");
+    strata::core::MtpLendClock lend_clock;
+    const auto lend_t0 = std::chrono::steady_clock::now();
     if (multi && model.dflash_ready())
         std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
                              "without it (and without the MTP block, which --dflash leaves unloaded)\n",
@@ -2992,6 +3001,32 @@ static int glm_pack_generate(const Options& o) {
         if (!deferred_pauses.empty() && !in_read_gap && admitting_rid.load() < 0 &&
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
+        // STRATA_GLM_MULTI_MTP_MAX (4): the draft windows only while that many requests or fewer run (below)
+        static const int mtp_max = (int) env_num("STRATA_GLM_MULTI_MTP_MAX", 4);
+        // STRATA_GLM_MTP_LEND: lend the draft layer's slots once more than mtp_max have run for a while, take them back
+        // once that many or fewer have (a lone request at once: its speculative decode next) - never inside a prompt's
+        // read (its gaps, between its pieces: the tail is lent to it and no boundary runs there)
+        if (mtp_lend && model.mtp_lend_ready()) {   // (false once a switch failed: lent for good, no drafting)
+            int running = (int) pending.size();
+            for (auto& gp : gens) running += !gp->done;
+            const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - lend_t0).count();
+            const double since = lend_clock.since;
+            const strata::core::MtpLendAct act = strata::core::mtp_lend_step(
+                lend_clock, strata::core::mtp_lend_policy(), now_s, running, mtp_max, in_read_gap || step_no_spec);
+            if (act != strata::core::MtpLendAct::none) {
+                const bool lend = act == strata::core::MtpLendAct::lend;
+                char why[96];
+                std::snprintf(why, sizeof why, "%d running (%s %d) for %.0f s", running, lend ? "above" : "at most",
+                              mtp_max, since >= 0.0 ? now_s - since : 0.0);
+                if (!multi_drain() || !model.mtp_lend_switch(lend, why, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                strata::core::mtp_lend_done(lend_clock, lend);
+                gen_sweep();   // (the drain may have ended some)
+                return;
+            }
+        }
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready()) {
             Gen& g = *only;
@@ -3049,10 +3084,10 @@ static int glm_pack_generate(const Options& o) {
         // (STRATA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
         // GPU is already busy and a window's rows cost about what the tokens they save cost; 0: always. Switching
         // drains what the other way has in flight)
-        static const int mtp_max = (int) env_num("STRATA_GLM_MULTI_MTP_MAX", 4);
+        // (STRATA_GLM_MTP_LEND: not while the draft layer's slots are lent - mtp_max is read above)
         int n_run = 0;
         for (auto& gp : gens) n_run += !gp->done;
-        const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max);
+        const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max) && !(mtp_lend && model.mtp_lent());
         if ((use_win && !flight.empty()) || (!use_win && !wflight.empty())) {
             if (!multi_drain()) {
                 multi_fail(err);

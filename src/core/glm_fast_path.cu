@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/mtp_lend.hpp"
 #include "strata/core/tier_policy.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -635,7 +636,7 @@ void Glm5Model::tail_layout(uint8_t* region) {
         if (!F->L[(size_t) il].moe) continue;
         const auto& P = F->lp[(size_t) il];
         strides.push_back(P.stride);
-        tails.push_back(P.n - P.n_main);
+        tails.push_back(P.n_tail - P.n_main);
         ils.push_back(il);
     }
     const strata::core::TailLayout lay =
@@ -1289,6 +1290,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
+        std::vector<std::vector<double>> lend_share;   // (STRATA_GLM_MTP_LEND: the shares, for the borrowed slots)
         // When the APU can hold every expert, keep exactly that many slots in each
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
@@ -1340,6 +1342,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool all = true;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe && share[(size_t) il].empty()) all = false;
+            if (all && strata::core::mtp_lend_policy().on) lend_share = share;
             if (all) {
                 const int cap = g.n_expert + gf::kSpares;
                 // the floor: a route's experts, the spares and the lendable tail, +16 when the budget has room for
@@ -1450,6 +1453,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
+            P.n_tail = nl;
             P.base = b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
@@ -1457,6 +1461,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             b += (size_t) P.n_main * P.stride;
             F->pool_slots += nl;
         }
+        // STRATA_GLM_MTP_LEND: the draft layer's main slots as borrowed slots of the trunk layers (kLent until lent)
+        if (strata::core::mtp_lend_policy().on && !mtp_lend_setup(lend_share, err)) return false;
         uint8_t* xregion = F->xpool;
         tail_layout(xregion);   // (STRATA_GLM_LEND_SPREAD: slot-major across the layers)
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
@@ -1767,7 +1773,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 if (F->L[(size_t) il].moe) {
                     const auto& P = F->lp[(size_t) il];
                     all += (double) g.n_expert * (double) P.stride;
-                    held += (double) std::min(g.n_expert, P.n) * (double) P.stride;
+                    held += (double) std::min(g.n_expert, P.n_tail) * (double) P.stride;
                 }
             prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
         }
@@ -3533,7 +3539,8 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         auto& P = F->lp[(size_t) il];
-        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares);
+        // (the borrowed slots past n_tail are the draft layer's memory at the start: STRATA_GLM_MTP_LEND)
+        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n_tail, g.n_expert, gf::kSpares);
         for (int j = 0; j < nv; ++j) {
             const int e = order[(size_t) il][(size_t) j];
             const int key = il * g.n_expert + e;
@@ -3787,6 +3794,7 @@ void Glm5Model::fast_destroy() {
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
+    mtp_lend_free();
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
@@ -4790,6 +4798,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         if (F->bg_hold) break;   // lending retires moves without starting spare-refill demotions
         auto& P = F->lp[(size_t) il];
         if (P.n == 0) continue;
+        if (F->ml.lent && il == F->ml.il) continue;   // (STRATA_GLM_MTP_LEND: the draft layer stays as it was lent)
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         for (int j = 0; j < gf::kSpares; ++j) {
             if (P.spare[j] >= 0) continue;
@@ -5005,6 +5014,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             std::vector<Cand> cands;
             for (int il = l0_; il < lt_; ++il) {
                 if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+                if (F->ml.lent && il == F->ml.il) continue;   // (STRATA_GLM_MTP_LEND: as above)
                 const auto& P = F->lp[(size_t) il];
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
                 int cs = -1;
@@ -5746,6 +5756,14 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: no draft block on this half";
         return false;
     }
+    if (F->ml.lent) {   // (STRATA_GLM_MTP_LEND: the schedulers draft only while it is owned - never expected here)
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "glm mtp lend: CUDA%d WARNING: a draft step while the draft layer's slots are lent "
+                                 "(its experts are missing: the drafts are poor, the tokens unchanged)\n", dev_);
+        }
+    }
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
     sub = sub && F->mtp_dv > 0;
@@ -6144,7 +6162,7 @@ bool Glm5Model::spec_ready() const {
         if (m->fast_ == nullptr) return false;
         last = m;
     }
-    return last->mtp_il_ >= 0;
+    return last->mtp_il_ >= 0 && !last->fast_->ml.lent;   // (STRATA_GLM_MTP_LEND: not while its slots are lent)
 }
 
 Glm5Model* Glm5Model::spec_head_last() {

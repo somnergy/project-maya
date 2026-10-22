@@ -504,22 +504,31 @@ struct Glm5Model::FastState {
     // STRATA_GLM_LEND_SPREAD=1 lays the tail out slot by slot across the layers instead (tail slot t of every layer,
     // then t + 1 ...: xstep = one slot of every layer), so a prompt that borrows the region's front takes a slot or two
     // from every layer rather than the whole tails of the first layers (tier_policy.hpp, tier_tail_layout).
+    // STRATA_GLM_MTP_LEND=1: slots [n_tail, n) are BORROWED - at bbase, inside the draft layer's main slots (one block of
+    // the pool on the split's last part, src/core/glm_mtp_lend.cu).  kLent while the draft layer holds that memory,
+    // ordinary slots of this layer while it is lent to the trunk.  Without it n_tail == n.
     struct LayerPool {
         uint8_t* base = nullptr;
         uint8_t* xbase = nullptr;
+        uint8_t* bbase = nullptr;
         size_t stride = 0;
         size_t xstep = 0;   // a tail slot to the next (0: stride, the layer's tail contiguous)
-        int n = 0, n_main = 0;
+        int n = 0, n_main = 0, n_tail = 0;
         size_t tail_step() const { return xstep != 0 ? xstep : stride; }
         uint8_t* slot_ptr(int s) const {
-            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * tail_step();
+            return s < n_main   ? base + (size_t) s * stride
+                   : s < n_tail ? xbase + (size_t) (s - n_main) * tail_step()
+                                : bbase + (size_t) (s - n_tail) * stride;
         }
         int slot_index(unsigned long long p) const {
             const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
             if (p >= b0 && p < b0 + (unsigned long long) n_main * stride) return (int) ((p - b0) / stride);
             const unsigned long long xs = (unsigned long long) tail_step();
-            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * xs && (p - x0) % xs == 0)
+            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n_tail - n_main) * xs && (p - x0) % xs == 0)
                 return n_main + (int) ((p - x0) / xs);
+            const unsigned long long bb = (unsigned long long) bbase;
+            if (bbase != nullptr && p >= bb && p < bb + (unsigned long long) (n - n_tail) * stride && (p - bb) % stride == 0)
+                return n_tail + (int) ((p - bb) / stride);
             return -1;
         }
         std::vector<int> key;        // slot -> expert, -1 none
@@ -587,6 +596,23 @@ struct Glm5Model::FastState {
     // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
     // need, lend_end) is a loan the layout did not use - where the prompt path's MMQ scratch lives (mmq::pool_slab)
     size_t lend_end = 0;
+    // STRATA_GLM_MTP_LEND (src/core/glm_mtp_lend.cu): the draft layer's main slots (region, one block) lent to this part's
+    // trunk layers as their borrowed slots while drafting is off.  Lent: the draft layer's slot map as it was (key and
+    // recency per main slot; -1 none) and its bytes in snap (pinned) - put back verbatim when it is reclaimed.
+    struct MtpLend {
+        bool on = false, lent = false;
+        bool broken = false;         // a switch failed: no more switches, and lent stays true (nothing drafts)
+        int il = -1;                 // the draft layer
+        uint8_t* region = nullptr;   // lp[il].base
+        size_t bytes = 0;            // lp[il].n_main * lp[il].stride
+        uint8_t* snap = nullptr;     // pinned, bytes
+        int slots = 0, layers = 0;   // the borrowed slots, the layers they went to
+        std::vector<int> key;
+        std::vector<uint64_t> tick;
+        uint64_t lends = 0, reclaims = 0;
+        double lent_s = 0.0;         // seconds lent in all (to the last reclaim)
+        std::chrono::steady_clock::time_point t_start = std::chrono::steady_clock::now(), t_lent{};
+    } ml;
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)
