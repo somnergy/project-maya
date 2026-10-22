@@ -426,9 +426,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the pieces a prompt is
-  # read in between decode steps (prefill_pieces); where a read cuts to keep its system prompt's state (prefix_cut): CPU only
+  # read in between decode steps (prefill_pieces); where a read cuts to keep its system prompt's state (prefix_cut); the
+  # decode tier's aged counts and swaps (tier_policy): CPU only
   foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test mtp_rows_test prefill_pieces_test
-         prefix_cut_test)
+         prefix_cut_test tier_policy_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
