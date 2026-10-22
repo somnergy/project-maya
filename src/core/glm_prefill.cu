@@ -2335,8 +2335,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the gate: the CPU lane is planned in only where PCIe moves an expert more than this many times slower than the
+    // lane computes one (STRATA_GLM_PREFILL_CPU_GATE, default 2: an expert's fixed cost on the CPU is about twice the
+    // one-token expert the start times); lower lets a card whose link is about twice the lane's speed share its experts
+    static const double pf_cpu_gate = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_CPU_GATE");
+        const double x = v != nullptr ? std::atof(v) : 2.0;
+        return x > 0.0 ? x : 2.0;
+    }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > pf_cpu_gate * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
