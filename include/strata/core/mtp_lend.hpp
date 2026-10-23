@@ -63,15 +63,23 @@ inline const MtpLendPolicy& mtp_lend_policy() {
 ///     then) and, with skip_read, the NextN block's dense weights and a device token_embd - as more borrowed slots,
 ///     the first GPUs' trunk layers included.  Weights come back from a pinned copy taken at the start, the buffers are
 ///     simply theirs again (the next window writes them before reading).
+///   - bg (STRATA_GLM_MTP_LEND_BG=1): the reclaim runs beside the decode - the borrowed slots' experts are copied to
+///     the RAM tier while the trunk still reads them, then the tables send their routes there (RAM-tier fetches or
+///     the CPU lane), then MTP's bytes are copied back, all on a copy stream; drafting resumes once those copies
+///     landed.  The last GPU stalls for the table edits only (not ~0.24 s); the borrowed slots' hot experts are not
+///     moved over colder residents (they come back by the tiers' refill and swaps).
 struct MtpLendExtra {
     bool skip_read = false;
     int catchup = 2048;   // positions a conversation (with skip_read)
     bool more = false;
+    bool bg = false;
 };
 
-inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catchup, const char* more = nullptr) {
+inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catchup, const char* more = nullptr,
+                                         const char* bg = nullptr) {
     MtpLendExtra x;
     x.more = more != nullptr && std::atoi(more) != 0;
+    x.bg = bg != nullptr && std::atoi(bg) != 0;
     x.skip_read = skip_read != nullptr && std::atoi(skip_read) != 0;
     if (catchup != nullptr && catchup[0] != '\0') {
         const long v = std::atol(catchup);
@@ -83,7 +91,7 @@ inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catc
 inline const MtpLendExtra& mtp_lend_extra() {
     static const MtpLendExtra x =
         mtp_lend_extra_parse(std::getenv("STRATA_GLM_MTP_LEND_SKIP_READ"), std::getenv("STRATA_GLM_MTP_LEND_CATCHUP"),
-                             std::getenv("STRATA_GLM_MTP_LEND_MORE"));
+                             std::getenv("STRATA_GLM_MTP_LEND_MORE"), std::getenv("STRATA_GLM_MTP_LEND_BG"));
     return x;
 }
 

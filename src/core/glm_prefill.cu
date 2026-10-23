@@ -1596,6 +1596,11 @@ bool Glm5Model::prefill_lend(std::string& err) {
     // while a VRAM reserve big enough to matter on CUDA1 (it lends 3021 MB of a 3048 MB maximum) would halve its
     // chunk - which is exactly what the flatten-to-smallest rule then spreads to all four parts.
     const uint64_t dropped_before = S->dropped;
+    // (STRATA_GLM_MTP_LEND_BG: a reclaim whose experts are still on their way to the RAM tier finishes that step first -
+    // the prompt path finds an expert only in a VRAM slot it may read or a RAM slot that holds it, not in between)
+    if (F->ml.phase == 1 &&
+        (!glmfast::cuda_ok(cudaEventSynchronize(F->ml.ev), "glm mtp reclaim copies", err) || !mtp_reclaim_advance(err)))
+        return false;
     if (!lend_tail(S->need + kMmqSlab, S->moved, S->dropped, err)) return false;
     {
         const size_t base = (size_t) (S->region + S->need);
