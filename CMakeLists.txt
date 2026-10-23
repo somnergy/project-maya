@@ -321,6 +321,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(glm_mv_inflight_bench PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(glm_mv_inflight_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_mv_inflight_parity COMMAND glm_mv_inflight_bench --parity-only)
+    # the DSA indexer's pool scores with several pools a warp (STRATA_GLM_DSA_SCORE_PPW) against one a warp, bitwise,
+    # and the times
+    add_executable(glm_dsa_score_bench tests/glm_dsa_score_bench.cu)
+    target_link_libraries(glm_dsa_score_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_dsa_score_parity COMMAND glm_dsa_score_bench --parity-only)
   endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
