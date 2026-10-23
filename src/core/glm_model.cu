@@ -628,7 +628,7 @@ Glm5Model::~Glm5Model() {
             SeqCtx& c = seq_[s];
             if (s > 0) {
                 for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
-                    if (d) cudaFree(d);
+                    if (d && !(d == c.kda_bak && mtpw_carved(d))) cudaFree(d);   // (MTP_LEND_MORE: the windows' block)
                 kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
             }
             if (c.hop_h) cudaFreeHost(c.hop_h);

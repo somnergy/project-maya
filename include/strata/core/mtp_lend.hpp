@@ -58,13 +58,20 @@ inline const MtpLendPolicy& mtp_lend_policy() {
 ///     trunk's hidden states of the last `catchup` positions a conversation's reads left out are kept (pinned RAM,
 ///     4 n_embd bytes a position) and fill its NextN cache before it drafts again (STRATA_GLM_MTP_LEND_CATCHUP,
 ///     default 2048; 0: none - those entries stay as they were, which only costs draft acceptance).
+///   - more (STRATA_GLM_MTP_LEND_MORE=1): MTP's other VRAM is lent too - every part's verify-window buffers (the
+///     conversations' recurrent-state copies, the windows' KDA inputs, their residual and draft rows: one block a part
+///     then) and, with skip_read, the NextN block's dense weights and a device token_embd - as more borrowed slots,
+///     the first GPUs' trunk layers included.  Weights come back from a pinned copy taken at the start, the buffers are
+///     simply theirs again (the next window writes them before reading).
 struct MtpLendExtra {
     bool skip_read = false;
     int catchup = 2048;   // positions a conversation (with skip_read)
+    bool more = false;
 };
 
-inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catchup) {
+inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catchup, const char* more = nullptr) {
     MtpLendExtra x;
+    x.more = more != nullptr && std::atoi(more) != 0;
     x.skip_read = skip_read != nullptr && std::atoi(skip_read) != 0;
     if (catchup != nullptr && catchup[0] != '\0') {
         const long v = std::atol(catchup);
@@ -75,7 +82,8 @@ inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catc
 
 inline const MtpLendExtra& mtp_lend_extra() {
     static const MtpLendExtra x =
-        mtp_lend_extra_parse(std::getenv("STRATA_GLM_MTP_LEND_SKIP_READ"), std::getenv("STRATA_GLM_MTP_LEND_CATCHUP"));
+        mtp_lend_extra_parse(std::getenv("STRATA_GLM_MTP_LEND_SKIP_READ"), std::getenv("STRATA_GLM_MTP_LEND_CATCHUP"),
+                             std::getenv("STRATA_GLM_MTP_LEND_MORE"));
     return x;
 }
 
@@ -216,6 +224,48 @@ inline std::vector<int> mtp_lend_counts(size_t region, const std::vector<size_t>
         left -= stride[(size_t) best];
     }
     return cnt;
+}
+
+/// The borrowed slots over SEVERAL regions (STRATA_GLM_MTP_LEND_MORE: the draft layer's slots, the windows' buffers, the
+/// NextN block's weights): the same greedy as mtp_lend_counts - each next slot to the layer whose next one serves the
+/// largest share, among the layers whose slot still fits some region - each slot at the front of the first region it
+/// fits.  Per layer, its slots' {region, offset} in the order given; the slots tile each region's front, no overlap.
+struct MtpLendSlot {
+    int region = 0;
+    size_t off = 0;
+};
+inline std::vector<std::vector<MtpLendSlot>> mtp_lend_place(const std::vector<size_t>& region,
+                                                            const std::vector<size_t>& stride,
+                                                            const std::vector<int>& have, int cap,
+                                                            const std::function<double(int, int)>& gain) {
+    const size_t n = stride.size();
+    std::vector<std::vector<MtpLendSlot>> out(n);
+    std::vector<size_t> left = region;
+    const auto fit = [&](size_t b) -> int {
+        for (size_t r = 0; r < left.size(); ++r)
+            if (left[r] >= b) return (int) r;
+        return -1;
+    };
+    for (;;) {
+        int best = -1, bh = 0;
+        double bg = -1.0;
+        for (size_t k = 0; k < n; ++k) {
+            if (stride[k] == 0 || fit(stride[k]) < 0) continue;
+            const int h = have[k] + (int) out[k].size();
+            if (h >= cap) continue;
+            const double gv = gain ? gain((int) k, h) : 0.0;
+            if (best < 0 || gv > bg || (gv == bg && h < bh)) {
+                best = (int) k;
+                bg = gv;
+                bh = h;
+            }
+        }
+        if (best < 0) break;
+        const int r = fit(stride[(size_t) best]);
+        out[(size_t) best].push_back({r, region[(size_t) r] - left[(size_t) r]});
+        left[(size_t) r] -= stride[(size_t) best];
+    }
+    return out;
 }
 
 }  // namespace strata::core

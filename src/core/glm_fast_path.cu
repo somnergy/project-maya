@@ -6207,7 +6207,8 @@ bool Glm5Model::spec_ready() const {
         if (m->fast_ == nullptr) return false;
         last = m;
     }
-    return last->mtp_il_ >= 0 && !last->fast_->ml.lent;   // (STRATA_GLM_MTP_LEND: not while its slots are lent)
+    // (STRATA_GLM_MTP_LEND: not while its slots are lent - nor, with _MORE, while any part's recurrent-state copies are)
+    return last->mtp_il_ >= 0 && !mtp_lent();
 }
 
 Glm5Model* Glm5Model::spec_head_last() {

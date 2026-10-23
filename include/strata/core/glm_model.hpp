@@ -1038,6 +1038,9 @@ public:
     bool mtp_lend_setup(const std::vector<std::vector<double>>& share, std::string& err);
     void mtp_lend_free();
     void mtp_catch_setup();
+    // STRATA_GLM_MTP_LEND_MORE: p is inside this part's windows' block (glm_mtp_rows.cu), and that block (null, 0: none)
+    bool mtpw_carved(const void* p) const;
+    std::pair<uint8_t*, size_t> mtpw_block() const;
     bool mtp_lend_part(bool lend, const std::string& why, std::string& err);
     bool mtp_lend_step_(bool lend, const std::string& why, std::string& err);   // (mtp_lend_part's body)
     // STRATA_GLM_MTP_LEND_SKIP_READ (the part with the draft layer): whether this chunk's NextN cache fill is left out
