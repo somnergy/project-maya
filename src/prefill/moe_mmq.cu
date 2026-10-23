@@ -8,6 +8,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -155,6 +156,30 @@ void dispatch(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s)
 
 }  // namespace
 
+int tile_cols(const int32_t* hb, int n, int max_rows, int fixed_cols) {
+    if (max_rows <= 0) return 0;
+    if (fixed_cols <= 0 || n <= 0) return max_rows;
+    int best = max_rows;
+    double best_cost = -1.0;
+    for (int J = 8; J <= 128; J += 8) {
+        double c = 0.0;
+        for (int e = 0; e < n; ++e) {
+            const int r = hb[e + 1] - hb[e];
+            if (r > 0) c += (double) ((r + J - 1) / J) * (double) (fixed_cols + J);
+        }
+        if (best_cost < 0.0 || c < best_cost) {
+            best_cost = c;
+            best = J;
+        }
+    }
+    return std::min(best, max_rows);
+}
+
+namespace {
+// the rows MMQ sizes its tile for (mul_mat_q_switch_J: the fewest tiles over them); the grid still covers max_rows
+int64_t opt_of(const Product& p) { return p.opt_rows > 0 ? std::min(p.opt_rows, p.max_rows) : p.max_rows; }
+}  // namespace
+
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
@@ -163,7 +188,7 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows, opt_of(p)};
     dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
 }
 
@@ -192,7 +217,7 @@ void Context::run_glu(const Product& p, float limit, void* stream) {
                   p.w_cols, n_ff, p.total_rows, bpr, p.total_rows, p.ld_dst,
                   p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                   1, 1, 0, 0, 0,
-                  p.max_rows, p.max_rows};
+                  p.max_rows, opt_of(p)};
     a.x_gate = (const char*) p.w;
     a.glu_limit = limit;
     dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
