@@ -816,6 +816,10 @@ struct Glm5Model::FastState {
     double cpu_ps_ms = 0.0;                  // ... one in a stream of copies (the prompt's staging)
     unsigned long long cpu_plan = 0;
     unsigned long long cpu_plan_start = 0;   // ... the plan the engine started with (set_pcie_share(-1) restores it)
+    // STRATA_GLM_CPU_PLAN_ROWS=<digits for f = 0..8>: the split for a batched step's grouped routes (rows_moe_grouped,
+    // 2+ rows) instead of cpu_plan; 0 = cpu_plan.  There each row's PCIe share is fetched on the compute stream before
+    // the next row routes, while the lane answers the group's experts as one merged request beside the GPU's
+    unsigned long long cpu_plan_rows = 0;
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)

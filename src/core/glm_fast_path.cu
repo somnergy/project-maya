@@ -3138,6 +3138,18 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     F->cpu_plan = plan;
     F->cpu_plan_start = plan;
+    if (const char* rv = getenv("STRATA_GLM_CPU_PLAN_ROWS")) {
+        std::string rtab;
+        unsigned long long rp = 0;
+        for (int f = 0; f <= 8; ++f) {
+            const int k = f < (int) std::strlen(rv) ? std::max(0, std::min(f, rv[f] - '0')) : 0;
+            rp |= (unsigned long long) k << (4 * f);
+            rtab += " " + std::to_string(k);
+        }
+        F->cpu_plan_rows = rp;
+        std::fprintf(stderr, "glm fast: CUDA%d CPU lane, a batched step's grouped rows (MAYA_GLM_CPU_PLAN_ROWS): of 0..8 "
+                             "RAM-tier experts the CPU takes%s\n", dev_, rtab.c_str());
+    }
     if (!cal_key.empty()) F->cal_file = calf, F->cal_key = cal_key;
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
@@ -5321,7 +5333,9 @@ void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, vo
                   g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
-                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
+                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il),
+                  !lane ? 0ull : win_rows > 0 && win_n >= 2 && F->cpu_plan_rows != 0ull ? F->cpu_plan_rows : F->cpu_plan,
+                  promote_min,
                   pf_rank, near_n, win, nullptr, win_n, il == mtp_il_ ? 8 : F->disk_skip_from,
                   il == mtp_il_ ? 0.0f : F->disk_skip_w, il == mtp_il_ ? 0.0f : [&] {
                       const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
