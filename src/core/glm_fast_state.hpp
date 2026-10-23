@@ -617,6 +617,22 @@ struct Glm5Model::FastState {
             const char* what = "";
         };
         std::vector<More> more;
+        // STRATA_GLM_MTP_LEND_BG: a reclaim in the background - phase 1: the borrowed slots' experts on their way to the
+        // RAM tier (still live in VRAM), 2: MTP's bytes on their way back (the tables send those experts' routes to the
+        // RAM tier); `cp` carries both, `ev` marks the phase's copies
+        int phase = 0;
+        struct Park {
+            int il, slot, key, rclass, rslot;
+        };
+        std::vector<Park> parks;
+        cudaStream_t cp = nullptr;
+        cudaEvent_t ev = nullptr, ev0 = nullptr;   // (ev0: the copies' start, for their time)
+        int polls = 0;
+        double park_ms = -1.0;
+        std::chrono::steady_clock::time_point t_bg0{}, t_flip{};
+        double stall_ms = 0.0;      // this reclaim's host-blocking time so far
+        uint64_t bg_dropped = 0;    // its experts that found no RAM slot (disk only)
+        std::string why;
         int slots = 0, layers = 0;   // the borrowed slots, the layers they went to
         std::vector<int> key;
         std::vector<uint64_t> tick;

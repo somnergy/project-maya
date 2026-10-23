@@ -191,6 +191,15 @@ bool Glm5Model::mtp_lend_setup(const std::vector<std::vector<double>>& share, st
         P.tick.resize((size_t) P.n, 0);
         P.st.resize((size_t) P.n, FastState::kLent);   // (MTP's memory until it is lent)
     }
+    // STRATA_GLM_MTP_LEND_BG: the reclaim's own copy stream (the tiers' copy stream stays free for their moves)
+    if (X.bg && (cudaStreamCreateWithFlags(&M.cp, cudaStreamNonBlocking) != cudaSuccess ||
+                 cudaEventCreate(&M.ev) != cudaSuccess || cudaEventCreate(&M.ev0) != cudaSuccess)) {
+        cudaGetLastError();
+        if (M.cp != nullptr) cudaStreamDestroy(M.cp);
+        M.cp = nullptr;
+        M.ev = nullptr;
+        std::fprintf(stderr, "glm mtp lend: CUDA%d no stream for the background reclaim - it stalls as before\n", dev_);
+    }
     M.on = true;
     M.slots = tot;
     M.layers = layers;
@@ -362,6 +371,14 @@ void Glm5Model::mtp_lend_free() {
                      (unsigned long long) M.lends, (unsigned long long) M.reclaims, lent, all,
                      100.0 * lent / std::max(1e-9, all));
     }
+    if (M.cp != nullptr) {   // (a background reclaim's copies land before their buffers go)
+        cudaStreamSynchronize(M.cp);
+        cudaStreamDestroy(M.cp);
+        M.cp = nullptr;
+    }
+    if (M.ev != nullptr) cudaEventDestroy(M.ev);
+    if (M.ev0 != nullptr) cudaEventDestroy(M.ev0);
+    M.ev = M.ev0 = nullptr;
     if (M.snap != nullptr) cudaFreeHost(M.snap);
     M.snap = nullptr;
     for (auto& r : M.more)
@@ -389,14 +406,255 @@ int64_t experts_out(const FastState* F, int l0, int l1, int skip, int NE) {
 // its slots are in, nothing drafts from them, and no switch is tried again (the error still ends the running requests).
 bool Glm5Model::mtp_lend_part(bool lend, const std::string& why, std::string& err) {
     FastState* F = fast_;
-    if (F == nullptr || !F->ml.on || F->ml.broken || F->ml.lent == lend) return true;
-    if (mtp_lend_step_(lend, why, err)) return true;
+    if (F == nullptr || !F->ml.on || F->ml.broken || F->ml.lent == lend || F->ml.phase != 0) return true;
+    // (STRATA_GLM_MTP_LEND_BG: a reclaim only starts here; mtp_reclaim_poll ends it)
+    const bool bg = !lend && mtp_lend_extra().bg && F->ml.cp != nullptr;
+    if (bg ? mtp_reclaim_begin(why, err) : mtp_lend_step_(lend, why, err)) return true;
     F->bg_hold = false;
     F->ml.broken = true;
     F->ml.lent = true;
+    F->ml.phase = 0;
     std::fprintf(stderr, "glm mtp lend: CUDA%d the %s failed (%s): no more switches, and no drafting from here on\n", dev_,
                  lend ? "lend" : "reclaim", err.c_str());
     return false;
+}
+
+namespace {
+// the draft layer's main slots, slot map and table entries as they were lent (its bytes are back): how many came back,
+// and how many found another slot meanwhile (never expected: the boundary leaves the draft layer alone while lent)
+bool draft_restore(FastState* F, int NE, std::string& err, int& back, int& lost) {
+    auto& M = F->ml;
+    auto& PD = F->lp[(size_t) M.il];
+    back = lost = 0;
+    std::lock_guard<std::mutex> lk(F->mu);
+    TableEdits ed{F, err};
+    for (int s = 0; s < PD.n_main; ++s) {
+        const int e = M.key[(size_t) s];
+        PD.tick[(size_t) s] = M.tick[(size_t) s];
+        PD.st[(size_t) s] = FastState::kFree;
+        PD.key[(size_t) s] = -1;
+        if (e < 0) continue;
+        const int key = M.il * NE + e;
+        if (F->slot_of[(size_t) key] >= 0) {
+            ++lost;
+            continue;
+        }
+        PD.st[(size_t) s] = FastState::kResident;
+        PD.key[(size_t) s] = e;
+        F->slot_of[(size_t) key] = s;
+        ed.upd(F->tab_key(key), (unsigned long long) PD.slot_ptr(s));
+        ++back;
+    }
+    return ed.flush();
+}
+}  // namespace
+
+// STRATA_GLM_MTP_LEND_BG, the reclaim's start (every part idle: the scheduler drained): the tier moves retire; the
+// borrowed slots leave the tiers' hands (kLent: no spare, no refill, no swap picks them) - a spare leaves the spare
+// table, an expert is copied to a free RAM-tier slot on the reclaim's stream while its VRAM copy stays live (the table
+// still points there), one with no free RAM slot is dropped now (disk only).  No wait for the copies.
+bool Glm5Model::mtp_reclaim_begin(const std::string& why, std::string& err) {
+    FastState* F = fast_;
+    auto& M = F->ml;
+    const int NE = g_.n_expert;
+    const auto t0 = std::chrono::steady_clock::now();
+    kda_bak_cur_ = false;
+    F->bg_hold = true;
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm mtp reclaim copies", err) || !fast_boundary(err))
+        return false;
+    if (!F->bg.empty() || !F->draining.empty()) {
+        err = "glm mtp reclaim: tier moves were not retired";
+        return false;
+    }
+    M.parks.clear();
+    M.polls = 0;
+    M.park_ms = -1.0;
+    if (M.ev0 != nullptr) cudaEventRecord(M.ev0, M.cp);
+    uint64_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(F->mu);
+        TableEdits ed{F, err};
+        for (int il = l0_; il < lt_ && ed.ok; ++il) {
+            if (!F->L[(size_t) il].moe) continue;
+            auto& P = F->lp[(size_t) il];
+            const int rcl = F->layer_rc[(size_t) il];
+            for (int s = P.n_tail; s < P.n; ++s) {
+                char& st = P.st[(size_t) s];
+                if (st == FastState::kSpare) {
+                    for (int j = 0; j < gf::kSpares; ++j)
+                        if (P.spare[j] == s) {
+                            P.spare[j] = -1;
+                            ed.upd(F->spare_key(il, j), 0ull);
+                        }
+                } else if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
+                    const int key = il * NE + P.key[(size_t) s];
+                    int rs = -1;
+                    if (rcl >= 0) {
+                        auto& R = F->rc[(size_t) rcl];
+                        for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
+                            if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
+                        if (rs >= 0) {
+                            if (!glmfast::cuda_ok(cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(s),
+                                                                  F->L[(size_t) il].blob, cudaMemcpyDeviceToHost, M.cp),
+                                                  "glm mtp reclaim park", err))
+                                return false;
+                            R.st[(size_t) rs] = FastState::kRDemote;   // (no victim, no table entry until it landed)
+                            R.key[(size_t) rs] = key;
+                            R.tick[(size_t) rs] = F->clock;
+                            F->ram_of[(size_t) key] = rs;
+                            M.parks.push_back({il, s, key, rcl, rs});
+                        }
+                    }
+                    if (rs < 0) {   // (nowhere to go: dropped - nothing runs on this part now)
+                        ed.upd(F->tab_key((size_t) key), 0ull);
+                        if (F->slot_of[(size_t) key] == s) F->slot_of[(size_t) key] = -1;
+                        F->left[(size_t) key] = 3;
+                        ++dropped;
+                    }
+                } else if (st == FastState::kLanding || st == FastState::kDraining) {
+                    err = "glm mtp reclaim: a borrowed slot is still moving";
+                    return false;
+                }
+                st = FastState::kLent;
+                P.key[(size_t) s] = -1;
+            }
+        }
+        if (!ed.flush()) return false;
+        F->check_resident(l0_, lt_, NE);
+    }
+    F->bg_hold = false;
+    if (!glmfast::cuda_ok(cudaEventRecord(M.ev, M.cp), "glm mtp reclaim event", err)) return false;
+    M.phase = 1;
+    M.t_bg0 = t0;
+    M.stall_ms = 1000.0 * secs(t0, std::chrono::steady_clock::now());
+    M.bg_dropped = dropped;
+    M.why = why;
+    return true;
+}
+
+// ... and on, between the scheduler's steps (the decode running meanwhile; the scheduler drains when a phase's copies
+// landed, so the edits find every part idle, as a boundary does): once the copies to the RAM tier landed, the tables
+// send those experts' routes there and MTP's bytes go back on the reclaim's stream; once those landed, the draft
+// layer's slot map comes back and drafting may resume
+bool Glm5Model::mtp_reclaim_step(std::string& err) {
+    FastState* F = fast_;
+    auto& M = F->ml;
+    if (M.phase == 0) return true;
+    ++M.polls;
+    const cudaError_t q = cudaEventQuery(M.ev);
+    if (q == cudaErrorNotReady) return true;
+    if (!glmfast::cuda_ok(q, "glm mtp reclaim event", err)) return false;
+    const int NE = g_.n_expert;
+    const bool draft = M.il >= 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    // the steps queued on this part finish, and the service thread has answered every route they asked, BEFORE the
+    // tier lock is taken (as the boundary does): a route of a step in flight waits for the service thread, which
+    // needs that lock - waiting for the stream while holding it deadlocked the decode
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp reclaim compute", err) || !F->route_ok(err)) return false;
+    while (F->processed.load(std::memory_order_acquire) < F->expected) glmfast::cpu_relax();
+    if (M.phase == 1) {
+        if (M.ev0 != nullptr) {   // (the copies' own time on the GPU, against the time to the step that saw them done)
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, M.ev0, M.ev) == cudaSuccess) M.park_ms = ms;
+            cudaGetLastError();
+        }
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            TableEdits ed{F, err};
+            for (const auto& pk : M.parks) {
+                auto& R = F->rc[(size_t) pk.rclass];
+                if (R.st[(size_t) pk.rslot] == FastState::kRDemote && R.key[(size_t) pk.rslot] == pk.key) {
+                    R.st[(size_t) pk.rslot] = FastState::kRHold;
+                    ed.upd(F->rtab_key((size_t) pk.key), (unsigned long long) (R.base + (size_t) pk.rslot * R.stride));
+                }
+                ed.upd(F->tab_key((size_t) pk.key), 0ull);
+                if (F->slot_of[(size_t) pk.key] == pk.slot) F->slot_of[(size_t) pk.key] = -1;
+            }
+            if (!ed.flush()) return false;
+            F->check_resident(l0_, lt_, NE);
+        }
+        // (no step ran since the stream was waited for above: nothing reads the borrowed slots any more)
+        if (draft && !glmfast::cuda_ok(cudaMemcpyAsync(M.region, M.snap, M.bytes, cudaMemcpyHostToDevice, M.cp),
+                                       "glm mtp reclaim copy in", err))
+            return false;
+        for (const auto& r : M.more)
+            if (r.copy != nullptr && !glmfast::cuda_ok(cudaMemcpyAsync(r.p, r.copy, r.bytes, cudaMemcpyHostToDevice, M.cp),
+                                                       "glm mtp reclaim copy in", err))
+                return false;
+        if (!glmfast::cuda_ok(cudaEventRecord(M.ev, M.cp), "glm mtp reclaim event", err)) return false;
+        M.phase = 2;
+        M.t_flip = std::chrono::steady_clock::now();
+        M.stall_ms += 1000.0 * secs(t0, M.t_flip);
+        return true;
+    }
+    int back = 0, lost = 0;
+    if (draft && !draft_restore(F, NE, err, back, lost)) return false;
+    {
+        std::lock_guard<std::mutex> lk(F->mu);
+        F->check_resident(l0_, lt_, NE);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    M.stall_ms += 1000.0 * secs(t0, t1);
+    M.phase = 0;
+    M.lent = false;
+    ++M.reclaims;
+    M.lent_s += secs(M.t_lent, t1);
+    const double all = secs(M.t_start, t1);
+    const size_t parked = M.parks.size();
+    M.parks.clear();
+    // (the "back in" time is what this part stalled for, as the synchronous reclaim's line says)
+    std::fprintf(stderr, "glm mtp lend: CUDA%d %s back in %.0f ms (%d experts restored%s): the borrowed slots' %zu experts "
+                         "left them - 0 over colder main residents, %zu parked in the RAM tier, %llu more in no tier (disk "
+                         "only) - %s, in the background: drafting again %.0f ms after the decision (copies to the RAM "
+                         "tier %.0f ms, %.0f of them copying, %d polls; back %.0f ms; %lld trunk experts in no tier now); "
+                         "lent %.0f%% of the time so far (%llu reclaims)\n",
+                 dev_, draft ? "the draft layer" : "MTP's buffers", M.stall_ms, back,
+                 lost > 0 ? (", " + std::to_string(lost) + " found elsewhere").c_str() : "",
+                 parked + (size_t) M.bg_dropped, parked, (unsigned long long) M.bg_dropped, M.why.c_str(),
+                 1000.0 * secs(M.t_bg0, t1), 1000.0 * secs(M.t_bg0, M.t_flip), M.park_ms, M.polls,
+                 1000.0 * secs(M.t_flip, t1), (long long) experts_out(F, l0_, l1_, M.il, NE),
+                 100.0 * M.lent_s / std::max(1e-9, all), (unsigned long long) M.reclaims);
+    return true;
+}
+
+bool Glm5Model::mtp_reclaiming() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr && m->fast_->ml.on && m->fast_->ml.phase != 0) return true;
+    return false;
+}
+
+// one part's reclaim moved on; a failure leaves it lent for good (no drafting) and stops the switching
+bool Glm5Model::mtp_reclaim_advance(std::string& err) {
+    FastState* F = fast_;
+    if (F == nullptr || !F->ml.on || F->ml.phase == 0) return true;
+    if (mtp_reclaim_step(err)) return true;
+    F->bg_hold = false;
+    F->ml.broken = true;
+    F->ml.lent = true;
+    F->ml.phase = 0;
+    std::fprintf(stderr, "glm mtp lend: CUDA%d the reclaim failed (%s): no more switches, and no drafting from here on\n",
+                 dev_, err.c_str());
+    return false;
+}
+
+bool Glm5Model::mtp_reclaim_due() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        if (F == nullptr || !F->ml.on || F->ml.phase == 0 || F->ml.ev == nullptr) continue;
+        if (cudaEventQuery(F->ml.ev) != cudaErrorNotReady) return true;   // (done, or an error the step reports)
+    }
+    return false;
+}
+
+bool Glm5Model::mtp_reclaim_poll(std::string& err) {
+    bool ok = true;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || !m->fast_->ml.on || m->fast_->ml.phase == 0) continue;
+        cudaSetDevice(m->dev_);
+        if (!m->mtp_reclaim_advance(err)) ok = false;
+    }
+    cudaSetDevice(dev_);
+    return ok;
 }
 
 bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& err) {
@@ -477,9 +735,11 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
         if (draft) std::snprintf(what, sizeof what, "the draft layer's %.2f GB (%d experts)", (double) M.bytes / 1073741824.0, held);
         else std::snprintf(what, sizeof what, "MTP's buffers (%.2f GB)", (double) more_b / 1073741824.0);
         std::fprintf(stderr, "glm mtp lend: CUDA%d lent %s to the trunk in %.0f ms: %d borrowed slots in %d layers%s for "
-                             "the tier's refill - %s; lent %.0f%% of the time so far (%llu lends)\n",
+                             "the tier's refill (%lld trunk experts in no tier) - %s; lent %.0f%% of the time so far "
+                             "(%llu lends)\n",
                      dev_, what, 1000.0 * secs(t0, t1), M.slots, M.layers,
-                     draft && more_b > 0 ? " (MTP's other memory too)" : "", why.c_str(),
+                     draft && more_b > 0 ? " (MTP's other memory too)" : "",
+                     (long long) experts_out(F, l0_, l1_, M.il, NE), why.c_str(),
                      100.0 * M.lent_s / std::max(1e-9, all), (unsigned long long) M.lends);
         return true;
     }
@@ -501,27 +761,9 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
             return false;
     // (4) its slot map and table entries as they were
     int back = 0, lost = 0;
+    if (draft && !draft_restore(F, NE, err, back, lost)) return false;
     {
         std::lock_guard<std::mutex> lk(F->mu);
-        TableEdits ed{F, err};
-        for (int s = 0; s < PD.n_main; ++s) {
-            const int e = M.key[(size_t) s];
-            PD.tick[(size_t) s] = M.tick[(size_t) s];
-            PD.st[(size_t) s] = FastState::kFree;
-            PD.key[(size_t) s] = -1;
-            if (e < 0) continue;
-            const int key = M.il * NE + e;
-            if (F->slot_of[(size_t) key] >= 0) {   // (it found another slot meanwhile - never expected: the boundary
-                ++lost;                            //  leaves the draft layer alone while lent - that one stays)
-                continue;
-            }
-            PD.st[(size_t) s] = FastState::kResident;
-            PD.key[(size_t) s] = e;
-            F->slot_of[(size_t) key] = s;
-            ed.upd(F->tab_key(key), (unsigned long long) PD.slot_ptr(s));
-            ++back;
-        }
-        if (!ed.flush()) return false;
         F->check_resident(l0_, lt_, NE);
     }
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp lend copy in", err)) return false;

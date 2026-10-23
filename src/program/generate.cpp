@@ -3008,12 +3008,23 @@ static int glm_pack_generate(const Options& o) {
         // once that many or fewer have (a lone request at once: its speculative decode next) - never inside a prompt's
         // read (its gaps, between its pieces: the tail is lent to it and no boundary runs there)
         if (mtp_lend && model.mtp_lend_ready()) {   // (false once a switch failed: lent for good, no drafting)
+            // (STRATA_GLM_MTP_LEND_BG: a reclaim in the background moves on once its copies landed - every part idle
+            // for the table edits, as at a boundary - never inside a read; no other switch until it is done)
+            const bool in_read = in_read_gap || step_no_spec;
+            if (!in_read && model.mtp_reclaiming() && model.mtp_reclaim_due()) {
+                if (!multi_drain() || !model.mtp_reclaim_poll(err)) {
+                    multi_fail(err);
+                    return;
+                }
+                gen_sweep();   // (the drain may have ended some)
+                return;
+            }
             int running = (int) pending.size();
             for (auto& gp : gens) running += !gp->done;
             const double now_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - lend_t0).count();
             const double since = lend_clock.since;
             const strata::core::MtpLendAct act = strata::core::mtp_lend_step(
-                lend_clock, strata::core::mtp_lend_policy(), now_s, running, mtp_max, in_read_gap || step_no_spec);
+                lend_clock, strata::core::mtp_lend_policy(), now_s, running, mtp_max, in_read || model.mtp_reclaiming());
             if (act != strata::core::MtpLendAct::none) {
                 const bool lend = act == strata::core::MtpLendAct::lend;
                 char why[96];
