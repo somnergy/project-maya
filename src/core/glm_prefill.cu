@@ -1537,6 +1537,17 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     const Glm5Geometry& g = g_;
     const size_t T = (size_t) Tn, E = (size_t) g.n_embd;
     S->sub = mixer_sub(T, g, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env);
+    // the indexer's key / gate ring holds a sub-batch with the open pool before it: a smaller ring (MAYA_GLM_IK_RING)
+    // caps the sub-batch (the default ring holds STRATA_GLM_PREFILL_SUB's largest)
+    if (S->has_dsa && ik_ring_ > 0 && S->sub > ik_ring_ - 64) {
+        const int cap = std::max(16, (ik_ring_ - 64) / 16 * 16);
+        static bool said = false;
+        if (!said)
+            std::fprintf(stderr, "glm prefill: CUDA%d mixer sub-batches of %d capped at %d by the indexer ring of %d "
+                         "positions (MAYA_GLM_IK_RING)\n", dev_, S->sub, cap, ik_ring_);
+        said = true;
+        S->sub = cap;
+    }
     // KV streaming: the stage holds the positions up to the prompt's end (whole pages), not the whole context - at 1M
     // positions the whole one is 1 GB a part, which every prompt would take from the expert pool
     size_t stage = (size_t) kv_stage_bytes_;
