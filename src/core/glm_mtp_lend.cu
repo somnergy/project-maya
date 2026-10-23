@@ -79,23 +79,64 @@ bool Glm5Model::mtp_lend_setup(const std::vector<std::vector<double>>& share, st
     FastState* F = fast_;
     auto& M = F->ml;
     const Glm5Geometry& g = g_;
+    const MtpLendExtra& X = mtp_lend_extra();
     const int d = mtp_il_;
-    if (d < l0_ || d >= lt_ || !F->L[(size_t) d].moe) return true;   // (a part without the draft layer)
+    const bool draft = d >= l0_ && d < lt_ && F->L[(size_t) d].moe;   // (this part carries the draft layer)
+    // STRATA_GLM_MTP_LEND_MORE: a part without it lends its windows' buffers (a model with the NextN block loaded)
+    if (!draft && !(X.more && g.nextn > 0 && getenv("STRATA_GLM_NO_MTP") == nullptr)) return true;
     const char* why = nullptr;
     if (multi_mtp_setting() <= 0) why = "it needs MAYA_GLM_MULTI_MTP";
-    else if (n_parts_ < 2 || split_next_ != nullptr) why = "it needs a split (the draft layer on its last part)";
+    else if (n_parts_ < 2 || (draft && split_next_ != nullptr)) why = "it needs a split (the draft layer on its last part)";
     else if (seq_count() < 2 || split_rows_setting() <= 0)
         why = "it needs --parallel and MAYA_GLM_SPLIT_ROWS (the windows' scheduler decides when)";
     else if (F->unified_memory || F->complete) why = "the pool holds every expert already";
-    else if (F->lp[(size_t) d].n_main <= 0) why = "the draft layer has no main slots";
+    else if (draft && F->lp[(size_t) d].n_main <= 0) why = "the draft layer has no main slots";
     if (why != nullptr) {
         std::fprintf(stderr, "glm mtp lend: CUDA%d off - %s\n", dev_, why);
         return true;
     }
-    const auto& PD = F->lp[(size_t) d];
-    M.il = d;
-    M.region = PD.base;
-    M.bytes = (size_t) PD.n_main * PD.stride;
+    // the regions: the draft layer's main slots (its bytes copied out at each lend), then (MORE) the windows' block
+    // (scratch) and the NextN block's weights that nothing reads while lent (copied out once, now)
+    std::vector<size_t> rb;
+    std::vector<uint8_t*> rp;
+    if (draft) {
+        const auto& PD = F->lp[(size_t) d];
+        M.il = d;
+        M.region = PD.base;
+        M.bytes = (size_t) PD.n_main * PD.stride;
+        rp.push_back(M.region);
+        rb.push_back(M.bytes);
+    }
+    M.more.clear();
+    if (X.more) {
+        const auto blk = mtpw_block();
+        if (blk.first != nullptr) M.more.push_back({blk.first, blk.second, nullptr, "the windows' buffers"});
+        // (the dense weights only when reads leave the cache fill out: a read is their one user while lent)
+        if (draft && X.skip_read && mtp_arena_ != nullptr && mtp_arena_bytes_ > 0)
+            M.more.push_back({(uint8_t*) mtp_arena_, (size_t) mtp_arena_bytes_, nullptr, "the NextN block's weights"});
+        if (draft && X.skip_read && F->mtp_emb != nullptr)
+            M.more.push_back({(uint8_t*) F->mtp_emb,
+                              (size_t) g.n_vocab * ggml_row_size((ggml_type) F->mtp_emb_type, g.n_embd), nullptr,
+                              "token_embd"});
+        for (auto& r : M.more) {
+            if (r.p == blk.first) continue;   // (scratch)
+            if (cudaHostAlloc((void**) &r.copy, r.bytes, cudaHostAllocDefault) != cudaSuccess ||
+                cudaMemcpy(r.copy, r.p, r.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();
+                if (r.copy != nullptr) cudaFreeHost(r.copy);
+                r.copy = nullptr;
+                r.bytes = 0;   // (not lent: it stays where it is)
+                std::fprintf(stderr, "glm mtp lend: CUDA%d %s stay (no pinned copy)\n", dev_, r.what);
+            }
+        }
+        M.more.erase(std::remove_if(M.more.begin(), M.more.end(), [](const FastState::MtpLend::More& r) { return r.bytes == 0; }),
+                     M.more.end());
+        for (const auto& r : M.more) {
+            rp.push_back(r.p);
+            rb.push_back(r.bytes);
+        }
+    }
+    if (rb.empty()) return true;
     // this part's trunk MoE layers and how many borrowed slots each: the pool's split continued over them
     std::vector<int> ils, have;
     std::vector<size_t> strides;
@@ -111,50 +152,76 @@ bool Glm5Model::mtp_lend_setup(const std::vector<std::vector<double>>& share, st
         const int j = h - gf::kSpares;   // (the pool split's own gain: the next expert's share; spares serve none)
         return j >= 0 && j < (int) share[il].size() ? share[il][(size_t) j] : 0.0;
     };
-    const std::vector<int> cnt = mtp_lend_counts(M.bytes, strides, have, g.n_expert + gf::kSpares, gain);
-    const TailLayout lay = tier_tail_layout(strides, cnt, false);
-    int tot = 0, layers = 0, cmin = INT_MAX, cmax = 0;
+    const std::vector<std::vector<MtpLendSlot>> pl = mtp_lend_place(rb, strides, have, g.n_expert + gf::kSpares, gain);
+    int tot = 0, layers = 0, cmin = INT_MAX, cmax = 0, in_more = 0;
     for (size_t k = 0; k < ils.size(); ++k) {
-        if (cnt[k] <= 0) continue;
-        tot += cnt[k];
+        const int c = (int) pl[k].size();
+        if (c <= 0) continue;
+        tot += c;
         ++layers;
-        cmin = std::min(cmin, cnt[k]);
-        cmax = std::max(cmax, cnt[k]);
+        cmin = std::min(cmin, c);
+        cmax = std::max(cmax, c);
+        for (const auto& sl : pl[k]) in_more += !draft || sl.region > 0;
     }
     if (tot == 0) {
-        std::fprintf(stderr, "glm mtp lend: CUDA%d off - the draft layer's slots hold no trunk slot\n", dev_);
+        std::fprintf(stderr, "glm mtp lend: CUDA%d off - MTP's lendable memory holds no trunk slot\n", dev_);
+        for (auto& r : M.more)
+            if (r.copy != nullptr) cudaFreeHost(r.copy);
+        M.more.clear();
         return true;
     }
     // the pinned copy the draft layer's bytes wait in while lent
-    if (cudaHostAlloc((void**) &M.snap, M.bytes, cudaHostAllocDefault) != cudaSuccess) {
+    if (draft && cudaHostAlloc((void**) &M.snap, M.bytes, cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         M.snap = nullptr;
         std::fprintf(stderr, "glm mtp lend: CUDA%d off - %.2f GB of pinned RAM for the draft layer's copy did not "
                              "allocate\n", dev_, (double) M.bytes / 1073741824.0);
+        for (auto& r : M.more)
+            if (r.copy != nullptr) cudaFreeHost(r.copy);
+        M.more.clear();
         return true;
     }
     for (size_t k = 0; k < ils.size(); ++k) {
-        if (cnt[k] <= 0) continue;
+        if (pl[k].empty()) continue;
         auto& P = F->lp[(size_t) ils[k]];
-        P.bbase = M.region + lay.off[k];
-        P.n = P.n_tail + cnt[k];
+        P.bptr.clear();
+        for (const auto& sl : pl[k]) P.bptr.push_back(rp[(size_t) sl.region] + sl.off);
+        P.n = P.n_tail + (int) pl[k].size();
         P.key.resize((size_t) P.n, -1);
         P.tick.resize((size_t) P.n, 0);
-        P.st.resize((size_t) P.n, FastState::kLent);   // (the draft layer's memory until it is lent)
+        P.st.resize((size_t) P.n, FastState::kLent);   // (MTP's memory until it is lent)
     }
     M.on = true;
     M.slots = tot;
     M.layers = layers;
-    M.key.assign((size_t) PD.n_main, -1);
-    M.tick.assign((size_t) PD.n_main, 0);
-    mtp_catch_setup();
+    if (draft) {
+        M.key.assign((size_t) F->lp[(size_t) d].n_main, -1);
+        M.tick.assign((size_t) F->lp[(size_t) d].n_main, 0);
+        mtp_catch_setup();
+    }
     const MtpLendPolicy& pol = mtp_lend_policy();
-    std::fprintf(stderr, "glm mtp lend: CUDA%d the draft layer's %d main slots (%.2f GB) serve %d slots of %d trunk layers "
-                         "(%d-%d a layer) while drafting is off (MAYA_GLM_MTP_LEND): lent after %.0f s with more than "
-                         "MAYA_GLM_MULTI_MTP_MAX running, back after %.0f s at that or fewer (one or none: at once); "
-                         "%.2f GB pinned for its copy\n",
-                 dev_, PD.n_main, (double) M.bytes / 1073741824.0, tot, layers, cmin, cmax, pol.lend_after,
-                 pol.reclaim_after, (double) M.bytes / 1073741824.0);
+    std::string more;
+    size_t more_b = 0, more_pin = 0;
+    for (const auto& r : M.more) {
+        more += std::string(more.empty() ? "" : ", ") + r.what + " " + std::to_string((r.bytes + (1 << 19)) >> 20) + " MB";
+        more_b += r.bytes;
+        more_pin += r.copy != nullptr ? r.bytes : 0;
+    }
+    char head[256], tail[384] = "";
+    if (draft)
+        std::snprintf(head, sizeof head, "the draft layer's %d main slots (%.2f GB)", F->lp[(size_t) d].n_main,
+                      (double) M.bytes / 1073741824.0);
+    else
+        std::snprintf(head, sizeof head, "MTP's memory (%s)", more.c_str());
+    if (draft && !more.empty())
+        std::snprintf(tail, sizeof tail, ", with MTP's other memory (%s: %d of the slots)", more.c_str(), in_more);
+    std::fprintf(stderr, "glm mtp lend: CUDA%d %s serve %d slots of %d trunk layers (%d-%d a layer)%s while drafting is "
+                         "off (MAYA_GLM_MTP_LEND%s): lent after %.0f s with more than MAYA_GLM_MULTI_MTP_MAX running, back "
+                         "after %.0f s at that or fewer (one or none: at once); %.2f GB pinned for the copies (%.2f GB "
+                         "lent in all)\n",
+                 dev_, head, tot, layers, cmin, cmax, tail, more.empty() ? "" : ", _MORE", pol.lend_after,
+                 pol.reclaim_after, (double) ((draft ? M.bytes : 0) + more_pin) / 1073741824.0,
+                 (double) ((draft ? M.bytes : 0) + more_b) / 1073741824.0);
     return true;
 }
 
@@ -297,6 +364,9 @@ void Glm5Model::mtp_lend_free() {
     }
     if (M.snap != nullptr) cudaFreeHost(M.snap);
     M.snap = nullptr;
+    for (auto& r : M.more)
+        if (r.copy != nullptr) cudaFreeHost(r.copy);
+    M.more.clear();
     M.on = false;
 }
 
@@ -333,8 +403,11 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
     FastState* F = fast_;
     auto& M = F->ml;
     const int NE = g_.n_expert;
-    auto& PD = F->lp[(size_t) M.il];
+    const bool draft = M.il >= 0;   // (MAYA_GLM_MTP_LEND_MORE: a part without the draft layer lends its buffers only)
+    static FastState::LayerPool none;
+    auto& PD = draft ? F->lp[(size_t) M.il] : none;
     const auto t0 = std::chrono::steady_clock::now();
+    kda_bak_cur_ = false;   // (the recurrent-state copies may be lent: never the live states' equal after this)
     if (lend) {
         // (1) the tier moves in flight land and retire, and none starts (lend_tail's way)
         F->bg_hold = true;
@@ -375,10 +448,10 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
             }
             if (!ed.flush()) return false;
         }
-        // (3) the block's bytes into the pinned copy
-        if (!glmfast::cuda_ok(cudaMemcpyAsync(M.snap, M.region, M.bytes, cudaMemcpyDeviceToHost, F->cs),
-                              "glm mtp lend copy out", err) ||
-            !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp lend copy out", err))
+        // (3) the block's bytes into the pinned copy (MORE's weights have theirs from the start; its buffers need none)
+        if (draft && (!glmfast::cuda_ok(cudaMemcpyAsync(M.snap, M.region, M.bytes, cudaMemcpyDeviceToHost, F->cs),
+                                        "glm mtp lend copy out", err) ||
+                      !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp lend copy out", err)))
             return false;
         // (4) the borrowed slots are the trunk's: free, for the boundary's spares and refill
         {
@@ -398,10 +471,15 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
         // the refill starts now (spares, then the hottest RAM-tier experts over the copy stream)
         if (!fast_boundary(err)) return false;
         const double all = secs(M.t_start, t1);
-        std::fprintf(stderr, "glm mtp lend: CUDA%d lent the draft layer's %.2f GB (%d experts) to the trunk in %.0f ms: "
-                             "%d borrowed slots in %d layers for the tier's refill - %s; lent %.0f%% of the time so far "
-                             "(%llu lends)\n",
-                     dev_, (double) M.bytes / 1073741824.0, held, 1000.0 * secs(t0, t1), M.slots, M.layers, why.c_str(),
+        size_t more_b = 0;
+        for (const auto& r : M.more) more_b += r.bytes;
+        char what[96];
+        if (draft) std::snprintf(what, sizeof what, "the draft layer's %.2f GB (%d experts)", (double) M.bytes / 1073741824.0, held);
+        else std::snprintf(what, sizeof what, "MTP's buffers (%.2f GB)", (double) more_b / 1073741824.0);
+        std::fprintf(stderr, "glm mtp lend: CUDA%d lent %s to the trunk in %.0f ms: %d borrowed slots in %d layers%s for "
+                             "the tier's refill - %s; lent %.0f%% of the time so far (%llu lends)\n",
+                     dev_, what, 1000.0 * secs(t0, t1), M.slots, M.layers,
+                     draft && more_b > 0 ? " (MTP's other memory too)" : "", why.c_str(),
                      100.0 * M.lent_s / std::max(1e-9, all), (unsigned long long) M.lends);
         return true;
     }
@@ -411,10 +489,16 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
     uint64_t moved = 0, evicted = 0;
     if (!lend_tail(0, moved, evicted, err, true)) return false;
     const uint64_t parked = F->diag_lend_park - park0;
-    // (3) the draft layer's bytes back, behind those copies on the same stream
-    if (!glmfast::cuda_ok(cudaMemcpyAsync(M.region, M.snap, M.bytes, cudaMemcpyHostToDevice, F->cs),
-                          "glm mtp lend copy in", err))
+    // (3) the draft layer's bytes back, behind those copies on the same stream; MORE's weights from their copies (its
+    //     buffers are the windows' again as they are: each window writes them before it reads them)
+    if (draft && !glmfast::cuda_ok(cudaMemcpyAsync(M.region, M.snap, M.bytes, cudaMemcpyHostToDevice, F->cs),
+                                   "glm mtp lend copy in", err))
         return false;
+    for (const auto& r : M.more)
+        if (r.copy != nullptr &&
+            !glmfast::cuda_ok(cudaMemcpyAsync(r.p, r.copy, r.bytes, cudaMemcpyHostToDevice, F->cs), "glm mtp lend copy in",
+                              err))
+            return false;
     // (4) its slot map and table entries as they were
     int back = 0, lost = 0;
     {
@@ -448,10 +532,10 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
     const auto t1 = std::chrono::steady_clock::now();
     M.lent_s += secs(M.t_lent, t1);
     const double all = secs(M.t_start, t1);
-    std::fprintf(stderr, "glm mtp lend: CUDA%d the draft layer back in %.0f ms (%d experts restored%s): the borrowed slots' "
+    std::fprintf(stderr, "glm mtp lend: CUDA%d %s back in %.0f ms (%d experts restored%s): the borrowed slots' "
                          "%llu experts left them - %llu over colder main residents, %llu parked in the RAM tier, %lld "
                          "more in no tier (disk only) - %s; lent %.0f%% of the time so far (%llu reclaims)\n",
-                 dev_, 1000.0 * secs(t0, t1), back,
+                 dev_, draft ? "the draft layer" : "MTP's buffers", 1000.0 * secs(t0, t1), back,
                  lost > 0 ? (", " + std::to_string(lost) + " found elsewhere").c_str() : "",
                  (unsigned long long) evicted, (unsigned long long) moved, (unsigned long long) parked,
                  (long long) disk, why.c_str(),
@@ -459,10 +543,15 @@ bool Glm5Model::mtp_lend_step_(bool lend, const std::string& why, std::string& e
     return true;
 }
 
+// (MAYA_GLM_MTP_LEND_MORE lends on every part: one that failed a switch stops the switching for all - nothing drafts)
 bool Glm5Model::mtp_lend_ready() const {
-    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
-        if (m->fast_ != nullptr && m->fast_->ml.on && !m->fast_->ml.broken) return true;
-    return false;
+    bool any = false;
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || !m->fast_->ml.on) continue;
+        if (m->fast_->ml.broken) return false;
+        any = true;
+    }
+    return any;
 }
 
 bool Glm5Model::mtp_lent() const {
@@ -472,14 +561,14 @@ bool Glm5Model::mtp_lent() const {
 }
 
 bool Glm5Model::mtp_lend_switch(bool lend, const std::string& why, std::string& err) {
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+    bool ok = true;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {   // (every part that lends: MORE's too)
         if (m->fast_ == nullptr || !m->fast_->ml.on) continue;
         cudaSetDevice(m->dev_);
-        const bool ok = m->mtp_lend_part(lend, why, err);
-        cudaSetDevice(dev_);
-        return ok;
+        if (!m->mtp_lend_part(lend, why, err)) ok = false;
     }
-    return true;
+    cudaSetDevice(dev_);
+    return ok;
 }
 
 }  // namespace strata::core

@@ -263,6 +263,54 @@ int main() {
         z.init(0);
         expect(z.append(0, 3, nx.data(), seg) == 0 && z.count == 0, "cap 0 keeps nothing");
     }
+    // STRATA_GLM_MTP_LEND_MORE: the parse, and the slots over several regions
+    {
+        expect(!mtp_lend_extra_parse(nullptr, nullptr, nullptr).more, "more: off by default");
+        expect(mtp_lend_extra_parse(nullptr, nullptr, "1").more, "more: 1");
+        // one region: the same counts as mtp_lend_counts
+        const size_t trunk = 11920000;
+        std::vector<size_t> st(21, trunk);
+        std::vector<int> have(21, 0);
+        for (int k = 0; k < 21; ++k) have[(size_t) k] = 204 + (k * 47) % 48;
+        const auto gain = [&](int k, int j) { return (1.0 + 0.05 * (21 - k)) / (1.0 + j); };
+        const size_t region = 222ull * 14930000ull;
+        const std::vector<int> cnt = mtp_lend_counts(region, st, have, 291, gain);
+        const auto pl = mtp_lend_place({region}, st, have, 291, gain);
+        bool same = pl.size() == cnt.size();
+        for (size_t k = 0; same && k < cnt.size(); ++k) same = (int) pl[k].size() == cnt[k];
+        expect(same, "one region: mtp_lend_counts' counts");
+        // Maya-L's last GPU with MORE: the draft region, the NextN block's weights, the windows' block
+        const std::vector<size_t> regs = {region, 173ull << 20, 603ull << 20};
+        const auto p3 = mtp_lend_place(regs, st, have, 291, gain);
+        std::vector<std::vector<std::pair<size_t, size_t>>> iv(regs.size());
+        int tot = 0;
+        bool inside = true;
+        for (size_t k = 0; k < p3.size(); ++k)
+            for (const auto& sl : p3[k]) {
+                ++tot;
+                inside = inside && sl.region >= 0 && sl.region < (int) regs.size() && sl.off + st[k] <= regs[(size_t) sl.region];
+                if (sl.region >= 0 && sl.region < (int) regs.size()) iv[(size_t) sl.region].push_back({sl.off, sl.off + st[k]});
+            }
+        bool tiled = true;
+        for (auto& v : iv) {
+            std::sort(v.begin(), v.end());
+            for (size_t i = 0; i < v.size(); ++i) tiled = tiled && v[i].first == (i == 0 ? 0 : v[i - 1].second);
+        }
+        int want = 0;
+        for (const size_t r : regs) want += (int) (r / trunk);
+        expect(inside && tiled, "several regions: every slot inside one, each region's front tiled, no overlap");
+        expect(tot == want, "several regions: as many slots as each region holds");
+        // a region smaller than every slot takes none; mixed strides go where they fit
+        const auto p4 = mtp_lend_place({50, 250, 100}, {100, 200}, {0, 0}, 291, nullptr);
+        int r0 = 0;
+        for (const auto& v : p4)
+            for (const auto& sl : v) r0 += sl.region == 0;
+        expect(r0 == 0, "a region smaller than every slot takes none");
+        size_t used1 = 0, used2 = 0;
+        for (size_t k = 0; k < p4.size(); ++k)
+            for (const auto& sl : p4[k]) (sl.region == 1 ? used1 : used2) += k == 0 ? 100 : 200;
+        expect(used1 <= 250 && used2 <= 100 && used1 + used2 >= 300, "mixed strides fill where they fit");
+    }
     if (fails == 0) std::printf("mtp_lend_test: all passed\n");
     return fails == 0 ? 0 : 1;
 }

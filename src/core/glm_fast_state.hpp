@@ -505,13 +505,14 @@ struct Glm5Model::FastState {
     // STRATA_GLM_LEND_SPREAD=1 lays the tail out slot by slot across the layers instead (tail slot t of every layer,
     // then t + 1 ...: xstep = one slot of every layer), so a prompt that borrows the region's front takes a slot or two
     // from every layer rather than the whole tails of the first layers (tier_policy.hpp, tier_tail_layout).
-    // STRATA_GLM_MTP_LEND=1: slots [n_tail, n) are BORROWED - at bbase, inside the draft layer's main slots (one block of
-    // the pool on the split's last part, src/core/glm_mtp_lend.cu).  kLent while the draft layer holds that memory,
-    // ordinary slots of this layer while it is lent to the trunk.  Without it n_tail == n.
+    // STRATA_GLM_MTP_LEND=1: slots [n_tail, n) are BORROWED - at bptr[s - n_tail], inside the draft layer's main slots
+    // (one block of the pool on the split's last part) and, with STRATA_GLM_MTP_LEND_MORE, MTP's other buffers on any
+    // part (src/core/glm_mtp_lend.cu).  kLent while MTP holds that memory, ordinary slots of this layer while it is lent
+    // to the trunk.  Without it n_tail == n.
     struct LayerPool {
         uint8_t* base = nullptr;
         uint8_t* xbase = nullptr;
-        uint8_t* bbase = nullptr;
+        std::vector<uint8_t*> bptr;   // the borrowed slots' addresses
         size_t stride = 0;
         size_t xstep = 0;   // a tail slot to the next (0: stride, the layer's tail contiguous)
         int n = 0, n_main = 0, n_tail = 0;
@@ -519,7 +520,7 @@ struct Glm5Model::FastState {
         uint8_t* slot_ptr(int s) const {
             return s < n_main   ? base + (size_t) s * stride
                    : s < n_tail ? xbase + (size_t) (s - n_main) * tail_step()
-                                : bbase + (size_t) (s - n_tail) * stride;
+                                : bptr[(size_t) (s - n_tail)];
         }
         int slot_index(unsigned long long p) const {
             const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
@@ -527,9 +528,8 @@ struct Glm5Model::FastState {
             const unsigned long long xs = (unsigned long long) tail_step();
             if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n_tail - n_main) * xs && (p - x0) % xs == 0)
                 return n_main + (int) ((p - x0) / xs);
-            const unsigned long long bb = (unsigned long long) bbase;
-            if (bbase != nullptr && p >= bb && p < bb + (unsigned long long) (n - n_tail) * stride && (p - bb) % stride == 0)
-                return n_tail + (int) ((p - bb) / stride);
+            for (size_t k = 0; k < bptr.size(); ++k)   // (a few dozen at most)
+                if ((unsigned long long) bptr[k] == p) return n_tail + (int) k;
             return -1;
         }
         std::vector<int> key;        // slot -> expert, -1 none
@@ -600,13 +600,22 @@ struct Glm5Model::FastState {
     // STRATA_GLM_MTP_LEND (src/core/glm_mtp_lend.cu): the draft layer's main slots (region, one block) lent to this part's
     // trunk layers as their borrowed slots while drafting is off.  Lent: the draft layer's slot map as it was (key and
     // recency per main slot; -1 none) and its bytes in snap (pinned) - put back verbatim when it is reclaimed.
+    // STRATA_GLM_MTP_LEND_MORE: further regions of this part (`more`): the windows' buffers (scratch: nothing to keep)
+    // and the NextN block's dense weights / device token_embd (weights: back from `copy`, pinned, taken at the start).
     struct MtpLend {
         bool on = false, lent = false;
         bool broken = false;         // a switch failed: no more switches, and lent stays true (nothing drafts)
-        int il = -1;                 // the draft layer
+        int il = -1;                 // the draft layer (-1: none on this part - only `more` regions lent)
         uint8_t* region = nullptr;   // lp[il].base
         size_t bytes = 0;            // lp[il].n_main * lp[il].stride
         uint8_t* snap = nullptr;     // pinned, bytes
+        struct More {
+            uint8_t* p = nullptr;
+            size_t bytes = 0;
+            uint8_t* copy = nullptr;   // pinned copy (weights); null: scratch
+            const char* what = "";
+        };
+        std::vector<More> more;
         int slots = 0, layers = 0;   // the borrowed slots, the layers they went to
         std::vector<int> key;
         std::vector<uint64_t> tick;
