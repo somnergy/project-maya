@@ -2024,7 +2024,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
         }
 }
 
-#if defined(STRATA_USE_HIP)
+// (also on NVIDIA, opt-in: STRATA_GLM_MV_INFLIGHT=1 - mv_rdna_device)
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
 // Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
 // head), and on a Radeon 8065S row_dot<14> ran them at 165-220 GB/s of the 273 the LPDDR5X gives: its loop is not
@@ -2063,12 +2063,16 @@ __device__ __forceinline__ Q6X q6_xload(const block_q8_1* x, int lane) {   // x:
 }
 // sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract
 __device__ __forceinline__ int q6_idot(int q, int u) {
+#if defined(STRATA_USE_HIP)
 #if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
     defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
     return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
                                    false);
 #else
     return __dp4a(__vsubss4(q, 0x20202020), u, 0);
+#endif
+#else
+    return __dp4a((int) __vsubss4(q, 0x20202020), u, 0);   // (dot_q6_K's own form on NVIDIA)
 #endif
 }
 // dot_q6_K's float arithmetic, term for term (the same products, sums and order)
@@ -2146,6 +2150,9 @@ __device__ __forceinline__ void bf16_rows_rdna(const uint16_t* row, const float*
 // BF16 job's WPB waves of one row; the dispatcher puts the BF16 jobs first so their long-K rows start early.
 template<int R, int NT, int U, int WPB, bool XL>
 __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+#if !defined(STRATA_USE_HIP)
+    if (b.skip != nullptr && *b.skip) return;   // (set_skip, as every other GEMV kernel here)
+#endif
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -2200,7 +2207,7 @@ __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CON
         }
     }
 }
-#endif
+// (end of the in-flight GEMV kernels)
 
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4900,7 +4907,7 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
-#if defined(STRATA_USE_HIP)
+// (the in-flight GEMV dispatch: RDNA3 by default, NVIDIA with STRATA_GLM_MV_INFLIGHT=1)
 namespace {
 // The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
 // or not.  The bench sets it (hip_expert_bench::mv_config); r == 0 is the original kernels, r < 0 the default: one row
@@ -4917,6 +4924,16 @@ constexpr int kMaxRdnaNt = 8;
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
 bool mv_rdna_device() {
+#if !defined(STRATA_USE_HIP)
+    // NVIDIA (STRATA_GLM_MV_INFLIGHT=1): row_dot<14> keeps one 210-byte block a lane in flight, so the dense GEMVs
+    // read at 64-78% of an RTX PRO 5000's 1.34 TB/s (a one-row decode step: 81 launches, 31% of its time); the same
+    // kernels with U blocks in flight, every row's sum row_dot's bit for bit
+    static const bool on_nv = [] {
+        const char* v = std::getenv("STRATA_GLM_MV_INFLIGHT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on_nv && g_mv_r.load(std::memory_order_relaxed) != 0;
+#else
     static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
@@ -4933,6 +4950,7 @@ bool mv_rdna_device() {
         cached_device = device;
     }
     return on;
+#endif
 }
 template<int NT, int R, int U>
 void mv_rdna_launch_w(const MvBatch& b, int blocks, int wpb, int lds, cudaStream_t s) {
@@ -4988,6 +5006,9 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
             }
     if (m == 0) return true;
     b.n = m;
+#if !defined(STRATA_USE_HIP)
+    b.skip = g_skip;
+#endif
     const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
     const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
     int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
@@ -5013,7 +5034,7 @@ void mv_config(int r, int u, int wpb, int lds) {
     g_mv_lds.store(lds);
 }
 }  // namespace hip_expert_bench
-#endif
+// (end of the in-flight GEMV dispatch)
 
 // A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done, in launches of up to exl3::kMaxMvJobs - nt > 0:
 // nt activations one after another (mv_nt's layout), else each job's ncol at its strides; a job's activations (a
@@ -5092,7 +5113,6 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         for (int i = 0; i < n; ++i) all = all && done[i];
         if (all) return true;
     }
-#if defined(STRATA_USE_HIP)
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
@@ -5123,7 +5143,6 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 if (sub_done[k]) done[idx[k]] = true;
         }
     }
-#endif
     // several columns: the tiled kernels (STRATA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
         const char* v = getenv("STRATA_GLM_MV_TILED");
@@ -5371,9 +5390,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
                 if (!mv(one, k, s)) return false;
                 continue;
             }
-#if defined(STRATA_USE_HIP)
             if (typed) mv_rdna(part, n, w, pd, s);
-#endif
             switch (w) {
                 case 2: mv_nt_launch<2>(part, n, typed, pd, s); break;
                 case 3: mv_nt_launch<3>(part, n, typed, pd, s); break;
@@ -5387,9 +5404,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         launch_check("mv_nt");
         return true;
     }
-#if defined(STRATA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
-#endif
     switch (nt) {
         case 2: mv_nt_launch<2>(jobs, n, typed, done, s); break;
         case 3: mv_nt_launch<3>(jobs, n, typed, done, s); break;
