@@ -1157,7 +1157,11 @@ static int glm_pack_generate(const Options& o) {
     std::mutex in_mu;
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
+    std::deque<std::chrono::steady_clock::time_point> in_at;   // each line's arrival (in_lines' order)
     bool in_eof = false;
+    // STRATA_GLM_ADMIT_SHORT_FIRST (set below, once the contexts and slots exist): which queued line goes next, called
+    // with in_mu held (null: the first, arrival order)
+    std::function<size_t()> line_pick;
     if (o.serve) {
         std::thread([&] {
             std::string l, buf;
@@ -1220,6 +1224,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 std::lock_guard<std::mutex> lk(in_mu);   // a GEN written before QUIT must still run (pipes)
                 in_lines.push_back(l);
+                in_at.push_back(std::chrono::steady_clock::now());
                 in_cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(in_mu);
@@ -1233,8 +1238,10 @@ static int glm_pack_generate(const Options& o) {
         std::unique_lock<std::mutex> lk(in_mu);
         in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || quit_req.load(); });
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it
-        out = std::move(in_lines.front());
-        in_lines.pop_front();
+        const size_t k = line_pick && in_lines.size() > 1 ? std::min(line_pick(), in_lines.size() - 1) : 0;
+        out = std::move(in_lines[k]);
+        in_lines.erase(in_lines.begin() + (long) k);
+        if (k < in_at.size()) in_at.erase(in_at.begin() + (long) k);
         return true;
     };
 
@@ -2416,10 +2423,95 @@ static int glm_pack_generate(const Options& o) {
     const auto try_line = [&](std::string& out) -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
         if (in_lines.empty()) return false;
-        out = std::move(in_lines.front());
-        in_lines.pop_front();
+        const size_t k = line_pick && in_lines.size() > 1 ? std::min(line_pick(), in_lines.size() - 1) : 0;
+        out = std::move(in_lines[k]);
+        in_lines.erase(in_lines.begin() + (long) k);
+        if (k < in_at.size()) in_at.erase(in_at.begin() + (long) k);
         return true;
     };
+    // STRATA_GLM_ADMIT_SHORT_FIRST=1: of the GEN lines waiting at the head of the input (up to the first other command,
+    // which keeps its place), the one with the fewest tokens to read goes first - its prompt less the longest snapshot
+    // or slot it extends, what its read will cost - instead of the first to arrive.  A request's read waits for every
+    // read before it, so a short turn queued behind another agent's long one waits that one out (FIFO: mean wait
+    // ~3 s at 8 agents, p90 ~10 s); shortest first cuts the mean.  A line that has waited STRATA_GLM_ADMIT_MAX_WAIT_S
+    // (30) goes next whatever its length, so a long read is not put off for ever.  Each request reads and decodes
+    // as it would have; only the order the reads start in changes (with experts in RAM, the tiers then see another
+    // order too)
+    static const bool short_first = multi && env_num("STRATA_GLM_ADMIT_SHORT_FIRST", 0) != 0;
+    static const double short_first_wait = env_num("STRATA_GLM_ADMIT_MAX_WAIT_S", 30.0);
+    uint64_t short_first_moves = 0;
+    if (short_first) {
+        std::fprintf(stderr, "glm multi: waiting requests are read shortest first (MAYA_GLM_ADMIT_SHORT_FIRST), a "
+                             "request waiting %.0f s or more next (MAYA_GLM_ADMIT_MAX_WAIT_S)\n", short_first_wait);
+        line_pick = [&]() -> size_t {
+            // the leading run of GEN lines (GENI, QUIT and the rest are barriers: nothing moves past them)
+            size_t n = 0;
+            while (n < in_lines.size() && in_lines[n].rfind("GEN ", 0) == 0) ++n;
+            if (n < 2) return 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (!in_at.empty() &&
+                std::chrono::duration<double>(now - in_at.front()).count() >= short_first_wait)
+                return 0;   // (the oldest line waited long enough: it goes, as in arrival order)
+            // the reads' sizes: every id after the last space, less the longest known prefix (a context's snapshot,
+            // bound or not, or a slot) - as gen_admit / prep_prompt will find it
+            std::vector<int32_t> ids;
+            const auto fresh = [&](const std::string& l) -> int64_t {
+                ids.clear();
+                const size_t sp = l.rfind(' ');
+                if (sp == std::string::npos) return INT64_MAX;
+                int64_t v = 0;
+                bool any = false;
+                for (size_t i = sp + 1; i < l.size(); ++i) {
+                    const char c = l[i];
+                    if (c >= '0' && c <= '9') {
+                        v = v * 10 + (c - '0');
+                        any = true;
+                    } else if (c == ',') {
+                        if (any) ids.push_back((int32_t) v);
+                        v = 0;
+                        any = false;
+                    } else {
+                        return INT64_MAX;   // (not an ids list: leave the line where it is)
+                    }
+                }
+                if (any) ids.push_back((int32_t) v);
+                if (ids.empty()) return INT64_MAX;
+                size_t best = 0;
+                const auto take = [&](const std::vector<int32_t>& t) {
+                    if (t.size() > best && t.size() < ids.size() && std::equal(t.begin(), t.end(), ids.begin()))
+                        best = t.size();
+                };
+                take(snap_tokens);
+                for (int c = 0; c < (int) ctxs.size(); ++c)
+                    if (c != cur_ctx) take(ctxs[(size_t) c].snap_tokens);
+                if (slot_max > 0)
+                    for (const auto& sl : slots) take(sl.tokens);
+                return (int64_t) (ids.size() - best);
+            };
+            size_t pick = 0;
+            int64_t pick_n = INT64_MAX, first_n = INT64_MAX;
+            for (size_t i = 0; i < n; ++i) {
+                const int64_t f = fresh(in_lines[i]);
+                if (i == 0) first_n = f;
+                if (f < pick_n) {
+                    pick_n = f;
+                    pick = i;
+                }
+            }
+            if (pick > 0) {
+                ++short_first_moves;
+                const auto rid_of = [](const std::string& l) -> int {
+                    const size_t r = l.find(" rid=");
+                    return r == std::string::npos ? -1 : std::atoi(l.c_str() + r + 5);
+                };
+                std::fprintf(stderr, "glm multi: request %d (%lld tokens to read) goes before %zu waiting (the first: "
+                                     "request %d, %lld tokens) - %llu moved so far\n",
+                             rid_of(in_lines[pick]), (long long) pick_n, pick, rid_of(in_lines[0]),
+                             (long long) first_n, (unsigned long long) short_first_moves);
+            }
+            return pick;
+        };
+    }
     // one written token of a request: its T line, the loop guard and the thinking budget (as run_request's
     // on_token), the stop conditions.  false: the request ends here (g.finish says why)
     const auto gen_token = [&](Gen& g, int tok) -> bool {
