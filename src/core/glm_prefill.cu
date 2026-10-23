@@ -160,6 +160,35 @@ __global__ void bf16_to_f16(const uint16_t* __restrict__ src, uint16_t* __restri
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         dst[i] = __half_as_ushort(__float2half(__uint_as_float((uint32_t) src[i] << 16)));
 }
+#endif
+#if !defined(STRATA_USE_HIP)
+// CUDA: the same FP16 MLA products, opt-in (STRATA_GLM_MLA_F16=1): the per-head q_abs and output products of a prompt's
+// DSA layers otherwise run as FP32 SIMT GEMMs (cuBLAS has no tensor-core path for them in FP32) - at 60-80K contexts
+// ~14 ms of a 1K-token read's GPU part and ~90 ms of an 8K one's.  FP16 inputs, FP32 sums: not bit-exact
+__global__ void pack_heads_f16_cu(const float* __restrict__ src, uint16_t* __restrict__ dst, int T, int H, int K) {
+    const int64_t n = (int64_t) T * H * K;
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const int k = (int) (i % K);
+        const int64_t r = i / K;
+        const int t = (int) (r % T), h = (int) (r / T);
+        dst[i] = __half_as_ushort(__float2half(src[((int64_t) t * H + h) * K + k]));
+    }
+}
+__global__ void bf16_to_f16_cu(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = __half_as_ushort(__float2half(__uint_as_float((uint32_t) src[i] << 16)));
+}
+bool mla_f16_cuda() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_MLA_F16");
+        const bool o = v != nullptr && std::atoi(v) != 0;
+        if (o) std::fprintf(stderr, "glm prefill: the MLA q_abs / output products in FP16 on the tensor cores (MAYA_GLM_MLA_F16)\n");
+        return o;
+    }();
+    return on;
+}
+#endif
+#if defined(STRATA_USE_HIP)
 bool env_on(const char* name) {
     const char* v = getenv(name);
     return !(v && v[0] == '0');
@@ -2613,6 +2642,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                                         g.kv_lora, g.n_head, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
                             "q_abs f16");
                 } else
+#else
+                const bool f16 = mla_f16_cuda() && (int64_t) g.qk_nope <= 2 * (int64_t) g.v_head &&
+                                 S->w16_elems >= std::max<int64_t>((int64_t) g.n_head * g.kv_lora * g.qk_nope,
+                                                                   (int64_t) g.n_head * g.v_head * g.kv_lora);
+                uint16_t* const hp_q = (uint16_t*) B.attn;   // (q packed per head into B.attn's space, the context into
+                uint16_t* const hp_c = (uint16_t*) B.q_abs;  //  B.q_abs's: both idle there, as on HIP)
+                if (f16) {
+                    bf16_to_f16_cu<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
+                    pack_heads_f16_cu<<<2048, 256, 0, s>>>(B.q, hp_q, tn, g.n_head, g.qk_nope);
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                                                       S->w16, CUDA_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
+                                                       hp_q, CUDA_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
+                                                       B.q_abs, CUDA_R_32F, g.n_head * g.kv_lora, g.kv_lora, g.n_head,
+                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "q_abs f16");
+                } else
 #endif
                 {
                 gb::bf16_to_f32(Ly.k_b, S->w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, s);
@@ -2647,6 +2692,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                                         hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
                                                         B.attn, HIP_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
                                                         HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                            "mla out f16");
+                } else
+#else
+                if (f16) {
+                    bf16_to_f16_cu<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
+                    pack_heads_f16_cu<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                                                       S->w16, CUDA_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
+                                                       hp_c, CUDA_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
+                                                       B.attn, CUDA_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
+                                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                             "mla out f16");
                 } else
 #endif
