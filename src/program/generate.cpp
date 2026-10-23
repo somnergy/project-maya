@@ -2294,7 +2294,14 @@ static int glm_pack_generate(const Options& o) {
     }
     // STRATA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
     // and the NextN block's drafts after it (Glm5Model::mtpw_*, strata/core/mtp_rows.hpp)
-    const bool mtp_rows = multi && model.mtpw_ok();
+    // STRATA_GLM_LOOKUP_DRAFT=<N>: the windows' drafts from a suffix lookup over each request's prompt and output
+    // (strata::spec::SuffixDrafter) after a match of at least N tokens - no NextN block (MAYA_GLM_NO_MTP), no draft
+    // pass; a window still keeps only the rows whose drafts are the tokens written, so the text is the same
+    const int lookup_n = strata::core::Glm5Model::lookup_draft_setting();
+    const bool mtp_rows = multi && (lookup_n > 0 ? model.mtpw_rows_ok() : model.mtpw_ok());
+    if (mtp_rows && lookup_n > 0)
+        std::fprintf(stderr, "glm lookup drafts: the windows' drafts from a prompt lookup (a match of %d tokens at "
+                             "least, up to %d drafts)\n", lookup_n, strata::core::Glm5Model::multi_mtp_setting());
     if (multi && strata::core::Glm5Model::multi_mtp_setting() > 0 && !mtp_rows)
         std::fprintf(stderr, "glm multi mtp: MAYA_GLM_MULTI_MTP is set but not used here - it needs MAYA_GLM_SPLIT_ROWS "
                              "on a split (or one GPU), the NextN block loaded (no MAYA_GLM_NO_MTP) and no --dflash\n");
@@ -2366,6 +2373,9 @@ static int glm_pack_generate(const Options& o) {
         int64_t draft_at = -1;
         int32_t draft_tok = -1;
         uint64_t mtp_steps = 0, mtp_drafts = 0, mtp_acc = 0;
+        // STRATA_GLM_LOOKUP_DRAFT: the suffix index over the prompt and the tokens written (lk_out of them so far)
+        std::unique_ptr<strata::spec::SuffixDrafter> lk;
+        size_t lk_out = 0, lk_cap = 0;
     };
     std::vector<std::unique_ptr<Gen>> gens;
     std::deque<Gen*> flight;     // issued, oldest first
@@ -2608,7 +2618,34 @@ static int glm_pack_generate(const Options& o) {
     // its pieces too; STRATA_GLM_MULTI_MTP_DRAFT_ROWS=0 drafts with the last part bound to each request - not while a
     // read keeps its context bound: those windows go without drafts)
     static const bool draft_rows = env_num("STRATA_GLM_MULTI_MTP_DRAFT_ROWS", 1) != 0;
-    const auto may_draft = [&] { return draft_rows || (!in_read_gap && !step_no_spec); };
+    const auto may_draft = [&] { return lookup_n <= 0 && (draft_rows || (!in_read_gap && !step_no_spec)); };
+    // the lookup's drafts for a request about to feed `pending`: the tokens that followed the longest earlier
+    // occurrence of its prompt-and-output's suffix (a match of lookup_n tokens at least), none while a token is forced
+    const auto lookup_drafts = [&](Gen& g) {
+        g.drafts.clear();
+        g.draft_at = -1;
+        if (g.pending < 0 || g.force >= 0) return;
+        if (!g.lk) {
+            // (room for the prompt and 64K tokens of output: ~32 B a slot, two slots a token; past it no more drafts -
+            // a full table would make every insert walk all of it)
+            g.lk_cap = g.prompt.size() + (size_t) std::min<int64_t>(std::max<int64_t>(0, g.max_new), 65536) + 64;
+            g.lk = std::make_unique<strata::spec::SuffixDrafter>(lookup_n, 64, g.lk_cap);
+            g.lk->append(g.prompt.data(), g.prompt.size());
+            g.lk_out = 0;
+        }
+        if (g.prompt.size() + g.emitted.size() > g.lk_cap) return;
+        if (g.lk_out < g.emitted.size()) {
+            g.lk->append(g.emitted.data() + g.lk_out, g.emitted.size() - g.lk_out);
+            g.lk_out = g.emitted.size();
+        }
+        const int D = strata::core::Glm5Model::multi_mtp_setting();
+        int32_t out[8];
+        const int k = g.lk->propose(std::min(D, 8), out);
+        if (k <= 0) return;
+        g.drafts.assign(out, out + k);
+        g.draft_at = model.seq_pos(g.ctx);
+        g.draft_tok = g.pending;
+    };
     const auto win_back = [&](WinGroup& w) -> bool {
         if (w.back) return true;
         w.back = true;
@@ -3087,7 +3124,11 @@ static int glm_pack_generate(const Options& o) {
         // (STRATA_GLM_MTP_LEND: not while the draft layer's slots are lent - mtp_max is read above)
         int n_run = 0;
         for (auto& gp : gens) n_run += !gp->done;
-        const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max) && !(mtp_lend && model.mtp_lent());
+        // (STRATA_GLM_LOOKUP_MAX with the lookup's drafts: 0, the default, windows whatever runs - a request without a
+        // match is a window of one row, its batched step's row)
+        static const int lookup_max = (int) env_num("STRATA_GLM_LOOKUP_MAX", 0);
+        const int win_max = lookup_n > 0 ? lookup_max : mtp_max;
+        const bool use_win = mtp_rows && (win_max <= 0 || n_run <= win_max) && !(mtp_lend && model.mtp_lent());
         if ((use_win && !flight.empty()) || (!use_win && !wflight.empty())) {
             if (!multi_drain()) {
                 multi_fail(err);
@@ -3108,6 +3149,8 @@ static int glm_pack_generate(const Options& o) {
             std::vector<Gen*> rdy;
             for (auto& gp : gens)
                 if (!gp->done && !gp->inflight && gp->pending >= 0) rdy.push_back(gp.get());
+            if (lookup_n > 0)
+                for (Gen* gp : rdy) lookup_drafts(*gp);
             size_t at = 0;
             for (const int gs : sizes) {
                 WinGroup w;

@@ -862,6 +862,12 @@ public:
     bool mtpw_setup(std::string& err);                    // fast_setup, every part: before the pool
     void mtpw_destroy();
     bool mtpw_ok() const;                                 // set up on every part, the NextN block on the last
+    /// The windows set up on every part, whatever makes their drafts: mtpw_front .. mtpw_commit need no NextN block
+    /// (STRATA_GLM_LOOKUP_DRAFT feeds them drafts from a prompt lookup instead; mtpw_draft_* need mtpw_ok).
+    bool mtpw_rows_ok() const;
+    /// STRATA_GLM_LOOKUP_DRAFT=<N>: the serve scheduler's windows take their drafts from a suffix lookup over the
+    /// request's prompt and output - only after a match of at least N tokens (3..64; 0: off, the NextN block's drafts)
+    static int lookup_draft_setting();
     /// The group's rows through every part but the last (nothing waited for).  tokens: every conversation's window
     /// one after another (counts[i] rows each); positions advance by counts[i] there.
     bool mtpw_front(const int* seqs, const int* counts, int n, const int32_t* tokens, std::string& err);

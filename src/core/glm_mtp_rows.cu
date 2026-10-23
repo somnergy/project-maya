@@ -239,14 +239,27 @@ void Glm5Model::mtpw_destroy() {
     mtpw_ = nullptr;
 }
 
-bool Glm5Model::mtpw_ok() const {
+bool Glm5Model::mtpw_rows_ok() const {
     if (multi_mtp_setting() <= 0 || seq_.empty()) return false;
-    const Glm5Model* last = this;
-    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || m->mtpw_ == nullptr || m->rows_ == nullptr) return false;
-        last = m;
-    }
+    return true;
+}
+
+bool Glm5Model::mtpw_ok() const {
+    if (!mtpw_rows_ok()) return false;
+    const Glm5Model* last = this;
+    while (last->split_next_) last = last->split_next_.get();
     return last->mtp_il_ >= 0 && last->fast_->mtpc.cap > 0 && last->fast_->mtp_tok != nullptr;
+}
+
+int Glm5Model::lookup_draft_setting() {
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_LOOKUP_DRAFT");
+        const int n = e != nullptr ? std::atoi(e) : 0;
+        return n <= 0 ? 0 : std::clamp(n, 3, 64);
+    }();
+    return v;
 }
 
 // a group's window rows on this part: conversation i's rows counts[i] in a row, at its positions p .. p + counts[i] - 1,
@@ -409,8 +422,8 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
 }
 
 bool Glm5Model::mtpw_front(const int* seqs, const int* counts, int n, const int32_t* tokens, std::string& err) {
-    if (!mtpw_ok()) {
-        err = "glm multi mtp: not set up (MAYA_GLM_MULTI_MTP with --parallel, the NextN block loaded)";
+    if (!mtpw_rows_ok()) {
+        err = "glm multi mtp: not set up (MAYA_GLM_MULTI_MTP with --parallel)";
         return false;
     }
     if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
