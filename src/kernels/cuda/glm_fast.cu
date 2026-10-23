@@ -23,6 +23,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 #include "dsa_topk.cuh"
+#include "glm_lat8.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -3236,7 +3237,8 @@ struct MlaToks {
 __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restrict__ q_abs, int64_t q_stride,
                                                             const uint16_t* __restrict__ lat,
                                                             const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
-                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8) {
+                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8,
+                                                            bool q8vec) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
     extern __shared__ uint4 smem4[];
     uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
@@ -3281,6 +3283,33 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
             for (int j = 0; j < MLA_CHUNK * MLA_KV / 8 / 128; ++j) {
                 const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
                 *(uint4*) (sL + s * MLA_ROW + 8 * c8) = v[j];
+            }
+        } else if (q8vec) {
+            // the INT8 records 8 values a load, every load of the chunk issued before the first conversion (as the
+            // FP16 rows above): glm_lat8.cuh's exact code -> FP16 and one FP16 multiply give lat_h(lat8_f)'s bits
+            constexpr int NJ = MLA_CHUNK * MLA_KV / 8 / 128;
+            constexpr int REC = lat8_rec_bytes(MLA_KV);
+            uint2 w[NJ];
+            __half d[NJ];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                const int cell = s_cell[s];
+                if (cell >= 0) {
+                    const uint8_t* rec = (const uint8_t*) lat + (size_t) REC * cell;
+                    w[j] = ((const uint2*) rec)[c8];
+                    d[j] = ((const __half*) (rec + MLA_KV))[c8 >> 2];
+                } else {
+                    w[j] = make_uint2(0u, 0u);   // codes 0 times a zero scale: +0, the scalar path's padding
+                    d[j] = __ushort_as_half((unsigned short) 0);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                const __half2 d2 = __half2half2(d[j]);
+                const uint2 lo = glmb::lat8_q4(w[j].x, d2), hi = glmb::lat8_q4(w[j].y, d2);
+                *(uint4*) (sL + s * MLA_ROW + 8 * c8) = make_uint4(lo.x, lo.y, hi.x, hi.y);
             }
         } else {
             for (int i = tid; i < MLA_CHUNK * MLA_KV; i += 128) {
@@ -5630,6 +5659,18 @@ static float* mla_part(int dev, int n_head, int kv_lora, int chunks, int* cap) {
     return part[dev];
 }
 
+// STRATA_GLM_ATTN_LAT8_VEC=1: the tensor-core attention reads INT8 latent records 8 values a load, all of a chunk's
+// loads in flight at once, instead of a byte and a scale a load (128 dependent rounds a thread a chunk: ~260 us a
+// one-row call at 2,048 cells on an RTX PRO 5000, as long as a launch of 4 rows).  The FP16 the chunk holds is the
+// same bit for bit (glm_lat8.cuh), so every sum is.
+static bool mla_lat8_vec() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_ATTN_LAT8_VEC");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 // whether this device takes the tensor-core attention (NVIDIA sm_80+); STRATA_GLM_MLA_MMA=0: the F32 chunks (A/B)
 static bool mla_mma_on(int dev) {
     static int on_[16] = {};
@@ -5669,7 +5710,8 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
         MlaToks tk{};
         for (int i = 0; i < nt; ++i) tk.n_sel[i] = n_sel[t0 + i];
         mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
-            q_abs + t0 * q_stride, q_stride, lat, cells + t0 * c_stride, c_stride, tk, n_head, qk_nope, part, lat_q8);
+            q_abs + t0 * q_stride, q_stride, lat, cells + t0 * c_stride, c_stride, tk, n_head, qk_nope, part, lat_q8,
+            lat_q8 && mla_lat8_vec());
         mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }
@@ -5699,7 +5741,8 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
             tk.cells[i] = cells[t0 + i];
         }
         mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
-            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8);
+            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8,
+            lat_q8 && mla_lat8_vec());
         mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }
