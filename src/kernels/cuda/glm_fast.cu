@@ -5047,7 +5047,17 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
-    const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+    int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+#if !defined(STRATA_USE_HIP)
+    // NVIDIA's default by the activations, the fastest of glm_mv_inflight_bench --sweep over a decode step's batches
+    // (RTX PRO 5000, a step's mix of Maya-L's batches against the original kernels): one row r1 u1 w4 (-15%), two
+    // r1 u2 w8 (-14%), three or more r2 u1 w4 (four: -28%); the activations from global memory
+    if (r < 0) {
+        if (nt == 1) r = 1, u = 1, wpb = 4;
+        else if (nt == 2) r = 1, u = 2, wpb = 8;
+        else r = 2, u = 1, wpb = 4;
+    }
+#endif
     if (r < 0) { r = 1; u = 2; }
     if (nt > 1 && r > 2) r = 2;
     MvBatch b{};
@@ -5067,7 +5077,11 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     b.skip = g_skip;
 #endif
     const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
+#if defined(STRATA_USE_HIP)
     const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
+#else
+    const bool use_lds = lds_mode > 0;   // (NVIDIA: staging the activations measured slower or even)
+#endif
     int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
     if (lds > 48 * 1024) lds = 0;
     switch (nt) {
