@@ -627,8 +627,10 @@ Glm5Model::~Glm5Model() {
         for (size_t s = 0; s < seq_.size(); ++s) {
             SeqCtx& c = seq_[s];
             if (s > 0) {
-                for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
+                for (float* d : {c.state, c.kda_bak})
                     if (d) cudaFree(d);
+                snap_free(c.snap);
+                snap_free(c.snap_pool);
                 kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
             }
             if (c.hop_h) cudaFreeHost(c.hop_h);
@@ -3392,7 +3394,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     dsa_pool_.assign((size_t) g_.n_layers + 1, 0);
     // the indexer key / gate caches: a ring on the fast path (the prompt path's largest sub-batch + 64 positions; see
     // ik_ring_), the whole context on the reference path (whose kernels index them by position)
-    ik_ring_ = fast_mode_ ? (int) std::min<int64_t>(max_ctx, 8192 + 64) : (int) max_ctx;
+    ik_ring_ = fast_mode_ ? ik_ring_rows(max_ctx, g_.idx_kpool) : (int) max_ctx;
     if (mtp_il_ >= 0) {
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;

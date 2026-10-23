@@ -3728,14 +3728,10 @@ void Glm5Model::fast_destroy() {
                          100.0 * e.first / tot);
     }
     for (auto e : F->pev) cudaEventDestroy(e);
-    if (snap_pool_) {
-        cudaFree(snap_pool_);
-        snap_pool_ = nullptr;
-    }
-    if (snap_) {
-        cudaFree(snap_);
-        snap_ = nullptr;
-    }
+    snap_free(snap_pool_);
+    snap_pool_ = nullptr;
+    snap_free(snap_);
+    snap_ = nullptr;
     if (kda_bak_) {
         cudaFree(kda_bak_);
         kda_bak_ = nullptr;
@@ -6699,19 +6695,14 @@ void Glm5Model::snap_pool_copy(bool restore) {
     const std::vector<int> ls = dsa_layers();
     const int64_t rows = (int64_t) (g.idx_kpool - 1) * g.idx_key;   // floats per cache
     if (ls.empty() || rows <= 0 || snap_pos_ < 0) return;
-    if (snap_pool_ == nullptr &&
-        cudaMalloc(&snap_pool_, (size_t) ls.size() * 2 * rows * sizeof(float)) != cudaSuccess) {
-        cudaGetLastError();
-        snap_pool_ = nullptr;
-        return;
-    }
+    if (snap_pool_ == nullptr && !snap_malloc(&snap_pool_, (size_t) ls.size() * 2 * rows * sizeof(float))) return;
     const int64_t at = (int64_t) g.idx_key * ((snap_pos_ - snap_pos_ % g.idx_kpool) % ik_ring_);
     for (size_t i = 0; i < ls.size(); ++i) {
         float* ring[2] = {state_ + dsa_ik_[(size_t) ls[i]] + at, state_ + dsa_ig_[(size_t) ls[i]] + at};
         for (int c = 0; c < 2; ++c) {
             float* keep = snap_pool_ + (i * 2 + (size_t) c) * rows;
             cudaMemcpyAsync(restore ? ring[c] : keep, restore ? keep : ring[c], (size_t) rows * sizeof(float),
-                            cudaMemcpyDeviceToDevice, fast_->cs);
+                            cudaMemcpyDefault, fast_->cs);   // (Default: the snapshot may be pinned host RAM)
         }
     }
 }
@@ -6725,10 +6716,7 @@ bool Glm5Model::snapshot_save() {
         int n_rec = 0;
         for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
         cudaSetDevice(m->dev_);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
-            cudaGetLastError();
-            m->snap_ = nullptr;
+        if (m->snap_ == nullptr && n_rec > 0 && !snap_malloc(&m->snap_, (size_t) n_rec * run * sizeof(float))) {
             cudaSetDevice(dev_);
             return false;
         }
@@ -6736,7 +6724,7 @@ bool Glm5Model::snapshot_save() {
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->snap_ + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
-                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+                                cudaMemcpyDefault, m->fast_->cs);
         m->snap_pos_ = pos_;
         m->snap_pool_copy(false);
         cudaStreamSynchronize(m->fast_->cs);
@@ -6760,7 +6748,7 @@ bool Glm5Model::snapshot_restore() {
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], m->snap_ + (size_t) k++ * run, run * sizeof(float),
-                                cudaMemcpyDeviceToDevice, m->fast_->cs);
+                                cudaMemcpyDefault, m->fast_->cs);
         m->snap_pool_copy(true);
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
@@ -6843,11 +6831,11 @@ bool Glm5Model::ckpt_save_snapshot(int slot, std::string& err) {
             ok = ok && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess;
             // the snapshot's layout is the checkpoint's: the KDA runs in layer order, then snap_pool_copy's rows
             if (ok && n_rec > 0)
-                ok = cudaMemcpyAsync(b.data(), m->snap_, (size_t) n_rec * run * sizeof(float), cudaMemcpyDeviceToHost,
+                ok = cudaMemcpyAsync(b.data(), m->snap_, (size_t) n_rec * run * sizeof(float), cudaMemcpyDefault,
                                      st) == cudaSuccess;
             if (ok && pool > 0)
                 ok = cudaMemcpyAsync(b.data() + (size_t) n_rec * run, m->snap_pool_, pool * sizeof(float),
-                                     cudaMemcpyDeviceToHost, st) == cudaSuccess;
+                                     cudaMemcpyDefault, st) == cudaSuccess;
             if (st) {
                 ok = cudaStreamSynchronize(st) == cudaSuccess && ok;
                 cudaStreamDestroy(st);
@@ -7106,10 +7094,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         }
         cudaSetDevice(m->dev_);
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
-            cudaGetLastError();
-            m->snap_ = nullptr;
+        if (m->snap_ == nullptr && n_rec > 0 && !snap_malloc(&m->snap_, (size_t) n_rec * run * sizeof(float))) {
             cudaSetDevice(dev_);
             err = "the snapshot did not allocate";
             return false;
@@ -7118,9 +7103,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) {
-            if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
-                cudaGetLastError();
-                m->snap_pool_ = nullptr;
+            if (m->snap_pool_ == nullptr && !snap_malloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float))) {
                 cudaSetDevice(dev_);
                 err = "the snapshot did not allocate";
                 return false;
@@ -7301,10 +7284,7 @@ bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::
         }
         cudaSetDevice(m->dev_);
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
-            cudaGetLastError();
-            m->snap_ = nullptr;
+        if (m->snap_ == nullptr && n_rec > 0 && !snap_malloc(&m->snap_, (size_t) n_rec * run * sizeof(float))) {
             cudaSetDevice(dev_);
             err = "the snapshot did not allocate";
             return false;
@@ -7313,9 +7293,7 @@ bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::
         if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
         const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
         if (pool_rows > 0) {
-            if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
-                cudaGetLastError();
-                m->snap_pool_ = nullptr;
+            if (m->snap_pool_ == nullptr && !snap_malloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float))) {
                 cudaSetDevice(dev_);
                 err = "the snapshot did not allocate";
                 return false;
