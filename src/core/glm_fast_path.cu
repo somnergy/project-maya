@@ -7064,6 +7064,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->mtp_catch_drop(m->cur_seq_, 0);   // (... nor its)
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = "cannot read " + path;
@@ -7259,6 +7260,7 @@ uint64_t Glm5Model::slot_save(std::vector<uint8_t>& data, std::string& err) {
 bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->mtp_catch_drop(m->cur_seq_, 0);   // (... nor its)
     size_t pos = 0;
     const auto get = [&](void* p, size_t bytes) {
         if (pos + bytes > data.size()) return false;

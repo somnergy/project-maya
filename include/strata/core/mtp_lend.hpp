@@ -14,6 +14,7 @@
 //   - HOW MANY (mtp_lend_counts): the region's bytes as slots of the trunk layers, each next slot to the layer whose
 //     next one serves the largest share of its routes (the pool's own split continued), never past a layer's cap.
 //     Their places in the region: tier_tail_layout(strides, counts, false) (layer-major, each layer's own stride).
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -50,6 +51,108 @@ inline const MtpLendPolicy& mtp_lend_policy() {
                                                   std::getenv("STRATA_GLM_MTP_RECLAIM_AFTER"));
     return p;
 }
+
+/// What else lending does (each opt-in, each needs STRATA_GLM_MTP_LEND):
+///   - skip_read (STRATA_GLM_MTP_LEND_SKIP_READ=1): a prompt read while the slots are lent leaves the NextN block's
+///     cache fill out (its eh_proj, norms and cache projections, and the host's dequantized next-token rows); the
+///     trunk's hidden states of the last `catchup` positions a conversation's reads left out are kept (pinned RAM,
+///     4 n_embd bytes a position) and fill its NextN cache before it drafts again (STRATA_GLM_MTP_LEND_CATCHUP,
+///     default 2048; 0: none - those entries stay as they were, which only costs draft acceptance).
+struct MtpLendExtra {
+    bool skip_read = false;
+    int catchup = 2048;   // positions a conversation (with skip_read)
+};
+
+inline MtpLendExtra mtp_lend_extra_parse(const char* skip_read, const char* catchup) {
+    MtpLendExtra x;
+    x.skip_read = skip_read != nullptr && std::atoi(skip_read) != 0;
+    if (catchup != nullptr && catchup[0] != '\0') {
+        const long v = std::atol(catchup);
+        if (v >= 0 && v <= (1L << 20)) x.catchup = (int) v;
+    }
+    return x;
+}
+
+inline const MtpLendExtra& mtp_lend_extra() {
+    static const MtpLendExtra x =
+        mtp_lend_extra_parse(std::getenv("STRATA_GLM_MTP_LEND_SKIP_READ"), std::getenv("STRATA_GLM_MTP_LEND_CATCHUP"));
+    return x;
+}
+
+/// One conversation's catch-up entries (skip_read): the positions whose NextN cache entry a read left out, the newest
+/// `cap` of them, in a ring whose index is also the row of the trunk's hidden state the engine keeps for it.  Entries
+/// go in by position (a read's chunks in order); a read at p first drops every entry at p or after (it rewrites them),
+/// so the ring stays sorted oldest -> newest.
+struct MtpCatchRing {
+    int cap = 0, head = 0, count = 0;   // head: the next index written; the newest `count` entries end before it
+    std::vector<int64_t> pos;
+    std::vector<int32_t> next;   // the token at pos + 1 (the entry's input beside the hidden state)
+    uint64_t lost = 0;           // entries pushed out by newer ones before a catch-up took them
+
+    void init(int c) {
+        cap = c > 0 ? c : 0;
+        head = count = 0;
+        pos.assign((size_t) cap, -1);
+        next.assign((size_t) cap, -1);
+        lost = 0;
+    }
+    int at(int k) const { return (head - count + k + 2 * cap) % cap; }   // the k-th oldest entry's index
+    /// every entry at position p or after goes (they are the newest: the ring is sorted)
+    void drop_from(int64_t p) {
+        while (count > 0 && pos[(size_t) at(count - 1)] >= p) {
+            --count;
+            head = (head - 1 + cap) % cap;
+        }
+    }
+    void clear() { head = count = 0; }
+    /// n entries at positions p0 .. p0 + n - 1 (tokens nx[0..n-1]); only the newest min(n, cap) are kept.  The rows go
+    /// to the indices returned as up to two runs: seg[i] = {first index, rows, the run's first row in the input}.
+    /// Returns the number of runs.
+    int append(int64_t p0, int n, const int32_t* nx, int seg[2][3]) {
+        if (cap <= 0 || n <= 0) return 0;
+        const int skip = n > cap ? n - cap : 0;
+        const int keep = n - skip;
+        lost += (uint64_t) std::max(0, count + keep - cap) + (uint64_t) skip;
+        int ns = 0, done = 0;
+        while (done < keep) {
+            const int run = std::min(keep - done, cap - head);
+            seg[ns][0] = head;
+            seg[ns][1] = run;
+            seg[ns][2] = skip + done;
+            ++ns;
+            for (int i = 0; i < run; ++i) {
+                pos[(size_t) head + (size_t) i] = p0 + skip + done + i;
+                next[(size_t) head + (size_t) i] = nx[skip + done + i];
+            }
+            head = (head + run) % cap;
+            done += run;
+        }
+        count = std::min(cap, count + keep);
+        return ns;
+    }
+    /// The entries a catch-up fills, oldest first, as runs of consecutive positions at consecutive indices, at most
+    /// `rows` each; only entries whose next token is behind `pend` (the conversation's position now) count.
+    /// fn(index, position, rows) per run.
+    template <class Fn> void runs(int64_t pend, int rows, Fn&& fn) const {
+        int k = 0;
+        while (k < count) {
+            const int i0 = at(k);
+            const int64_t p = pos[(size_t) i0];
+            if (p < 0 || p + 1 >= pend) {
+                ++k;
+                continue;
+            }
+            int n = 1;
+            while (k + n < count && n < rows) {
+                const int i = at(k + n);
+                if (i != i0 + n || pos[(size_t) i] != p + n || p + n + 1 >= pend) break;
+                ++n;
+            }
+            fn(i0, p, n);
+            k += n;
+        }
+    }
+};
 
 enum class MtpLendAct { none, lend, reclaim };
 

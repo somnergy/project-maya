@@ -849,6 +849,7 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    mtp_catch_drop(cur_seq_, 0);   // (nor are the NextN catch-up's entries its)
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();

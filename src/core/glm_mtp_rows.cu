@@ -773,6 +773,8 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         const int sq = seqs[c];
         const int k = keep[c];
         const int64_t p0 = M->p0[(size_t) sq];   // (the window's start; the commit set the position to p0 + k)
+        // (STRATA_GLM_MTP_LEND_SKIP_READ: what its reads left out of the cache while lent, before its first drafts)
+        if (!L->mtp_catchup_part(sq, err)) return false;
         if (draft_rows) {
             L->mtpw_bind(sq, base[c]);
             if (k > 1 && !L->mtpw_cache_rows(base[c], p0, k - 1, M->hx[(size_t) sq], written + at,
