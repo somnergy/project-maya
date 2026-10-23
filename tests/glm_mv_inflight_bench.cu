@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
         check(cudaFree(p), "free");
         check(cudaFree(o), "free");
     }
-    std::vector<Config> cfgs = {{-1, 2, 8, -1}};
+    std::vector<Config> cfgs = {{-1, 2, 8, -1}};   // (the default: on NVIDIA its shape by the activations)
     if (sweep || parity_only) {
         cfgs.clear();
         for (int lds : {0, 1})
