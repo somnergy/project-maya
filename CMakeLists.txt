@@ -309,6 +309,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_rows_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_rows_attn_test COMMAND glm_rows_attn_test)
     set_tests_properties(glm_rows_attn_test PROPERTIES TIMEOUT 300)
+    # the decode attention over INT8 latent records against FP16 rows of the same values (STRATA_GLM_ATTN_LAT8_VEC
+    # on and off), bitwise, with each path's time
+    add_executable(glm_lat8_attn_test tests/glm_lat8_attn_test.cu)
+    target_link_libraries(glm_lat8_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_lat8_attn_test COMMAND glm_lat8_attn_test)
+    set_tests_properties(glm_lat8_attn_test PROPERTIES TIMEOUT 120)
   endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
