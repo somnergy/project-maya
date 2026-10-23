@@ -3577,11 +3577,16 @@ bool Glm5Model::fast_warm(std::string& err) {
     const size_t N = (size_t) F->n_keys;
     std::vector<unsigned long long> th(2 * N + (size_t) NL * gf::kSpares, 0ull);
     std::vector<int> next((size_t) NL, 0);
+    if (glmfast::spares_setting(gf::kSpares) < gf::kSpares)
+        std::fprintf(stderr, "glm fast: CUDA%d %d spare slots a layer for the routes' PCIe fetches (MAYA_GLM_SPARES; %d by "
+                             "default): the others hold experts\n", dev_, glmfast::spares_setting(gf::kSpares),
+                     gf::kSpares);
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         auto& P = F->lp[(size_t) il];
         // (the borrowed slots past n_tail are the draft layer's memory at the start: STRATA_GLM_MTP_LEND)
-        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n_tail, g.n_expert, gf::kSpares);
+        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n_tail, g.n_expert,
+                                                glmfast::spares_setting(gf::kSpares));
         for (int j = 0; j < nv; ++j) {
             const int e = order[(size_t) il][(size_t) j];
             const int key = il * g.n_expert + e;
@@ -4838,7 +4843,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         if (P.n == 0) continue;
         if (F->ml.lent && il == F->ml.il) continue;   // (STRATA_GLM_MTP_LEND: the draft layer stays as it was lent)
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-        for (int j = 0; j < gf::kSpares; ++j) {
+        for (int j = 0; j < glmfast::spares_setting(gf::kSpares); ++j) {   // (STRATA_GLM_SPARES: fewer kept empty)
             if (P.spare[j] >= 0) continue;
             int s = -1;
             for (int s2 = 0; s2 < P.n; ++s2)
