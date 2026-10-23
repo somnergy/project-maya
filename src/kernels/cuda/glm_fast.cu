@@ -2910,6 +2910,62 @@ __device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, co
     if (lane == 0) score[p] = acc;
 }
 
+// STRATA_GLM_DSA_SCORE_PPW=N (2..32): dsa_score_block with N pools a warp - the query staged in shared memory once for
+// 8 N pools instead of 8, each warp's key (key_dim 128: 4 values a lane) in registers instead of re-read for each of
+// the 32 heads, two pools' heads interleaved.  Every pool's sum is dsa_score_block's: the same products in the same
+// order, the same warp_sum, the same relu-weighted sum over the heads.
+__device__ __forceinline__ void dsa_score_block_ppw(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                    const float* __restrict__ iw, int idx_heads, int n_pools,
+                                                    float* __restrict__ score, int ppw) {
+    constexpr int KD = 128;
+    extern __shared__ float s_iq[];   // idx_heads * KD, then idx_heads weights
+    float* s_iw = s_iq + idx_heads * KD;
+    for (int i = threadIdx.x; i < idx_heads * KD; i += blockDim.x) s_iq[i] = iq[i];
+    for (int i = threadIdx.x; i < idx_heads; i += blockDim.x) s_iw[i] = iw[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int base = blockIdx.x * nw * ppw + warp;
+    for (int i = 0; i < ppw; i += 2) {
+        const int p0 = base + i * nw, p1 = p0 + nw;
+        if (p0 >= n_pools) return;
+        const bool two = i + 1 < ppw && p1 < n_pools;
+        float k0[KD / 32], k1[KD / 32];
+#pragma unroll
+        for (int j = 0; j < KD / 32; ++j) {
+            k0[j] = pooled[(size_t) KD * p0 + lane + 32 * j];
+            k1[j] = two ? pooled[(size_t) KD * p1 + lane + 32 * j] : 0.0f;
+        }
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (int h = 0; h < idx_heads; ++h) {
+            float d0 = 0.0f, d1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < KD / 32; ++j) {
+                const float q = s_iq[h * KD + lane + 32 * j];
+                d0 += q * k0[j];
+                d1 += q * k1[j];
+            }
+            d0 = warp_sum(d0);
+            d1 = warp_sum(d1);
+            acc0 += fmaxf(d0, 0.0f) * s_iw[h];
+            acc1 += fmaxf(d1, 0.0f) * s_iw[h];
+        }
+        if (lane == 0) {
+            score[p0] = acc0;
+            if (two) score[p1] = acc1;
+        }
+    }
+}
+__global__ void __launch_bounds__(256) dsa_score_ppw_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                            const float* __restrict__ iw, int idx_heads, int n_pools,
+                                                            float* __restrict__ score, int ppw) {
+    dsa_score_block_ppw(iq, pooled, iw, idx_heads, n_pools, score, ppw);
+}
+__global__ void __launch_bounds__(256) dsa_score_rows_ppw_kernel(DsaScoreRows a, int idx_heads, int ppw) {
+    const int r = blockIdx.y;
+    if ((int) blockIdx.x * (int) (blockDim.x >> 5) * ppw >= a.n_pools[r]) return;
+    dsa_score_block_ppw(a.iq[r], a.pooled[r], a.iw[r], idx_heads, a.n_pools[r], a.score[r], ppw);
+}
+
 __device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
                                                  int n_sel, int pos, int* __restrict__ cells);
 __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restrict__ score, int n_vis, int kpool,
@@ -5580,10 +5636,30 @@ void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
     launch_check("dsa_prep");
 }
 
+// the pools a warp of the indexer's scores (STRATA_GLM_DSA_SCORE_PPW, 1 = the original kernel; dsa_score_config:
+// a bench's override, < 0 back to the setting)
+static std::atomic<int> g_dsa_ppw_override{-1};
+void dsa_score_config(int ppw) { g_dsa_ppw_override.store(ppw); }
+static int dsa_score_ppw(int key_dim) {
+    static const int env = [] {
+        const char* v = getenv("STRATA_GLM_DSA_SCORE_PPW");
+        return v == nullptr ? 1 : std::max(1, std::min(32, std::atoi(v)));
+    }();
+    const int o = g_dsa_ppw_override.load(std::memory_order_relaxed);
+    const int ppw = o >= 1 ? std::min(32, o) : env;
+    return key_dim == 128 ? ppw : 1;
+}
+
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s) {
     if (n_pools <= 0) return;
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    if (const int ppw = dsa_score_ppw(key_dim); ppw > 1) {
+        dsa_score_ppw_kernel<<<(n_pools + 8 * ppw - 1) / (8 * ppw), 256, smem, s>>>(iq, pooled, iw, idx_heads, n_pools,
+                                                                                    score, ppw);
+        launch_check("dsa_score");
+        return;
+    }
     dsa_score_kernel<<<(n_pools + 7) / 8, 256, smem, s>>>(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
     launch_check("dsa_score");
 }
@@ -5593,6 +5669,12 @@ void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cu
     for (int r = 0; r < n; ++r) most = std::max(most, a.n_pools[r]);
     if (n < 1 || most < 1) return;
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    if (const int ppw = dsa_score_ppw(key_dim); ppw > 1) {
+        dsa_score_rows_ppw_kernel<<<dim3((unsigned) ((most + 8 * ppw - 1) / (8 * ppw)), (unsigned) n), 256, smem, s>>>(
+            a, idx_heads, ppw);
+        launch_check("dsa_score_rows");
+        return;
+    }
     dsa_score_rows_kernel<<<dim3((unsigned) ((most + 7) / 8), (unsigned) n), 256, smem, s>>>(a, key_dim, idx_heads);
     launch_check("dsa_score_rows");
 }
