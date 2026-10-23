@@ -6710,9 +6710,50 @@ void Glm5Model::snap_pool_copy(bool restore) {
     }
 }
 
+namespace {
+// STRATA_GLM_SNAP_TIMING=1: what the snapshot copies cost (a save at a prompt's end / PAUSE, a restore at a turn's
+// start) - the copies' own time on the halves' streams (the longest half) and the call's wall, said every 32 saves
+struct SnapTiming {
+    bool on = getenv("STRATA_GLM_SNAP_TIMING") != nullptr && std::atoi(getenv("STRATA_GLM_SNAP_TIMING")) != 0;
+    uint64_t n[2] = {0, 0};
+    double copy_ms[2] = {0, 0}, wall_ms[2] = {0, 0};
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> ev;   // per half
+    std::pair<cudaEvent_t, cudaEvent_t>& at(size_t h) {
+        while (ev.size() <= h) {
+            std::pair<cudaEvent_t, cudaEvent_t> e{nullptr, nullptr};
+            cudaEventCreate(&e.first);
+            cudaEventCreate(&e.second);
+            ev.push_back(e);
+        }
+        return ev[h];
+    }
+    void add(int what, double copy, double wall) {
+        ++n[what];
+        copy_ms[what] += copy;
+        wall_ms[what] += wall;
+        if (what == 0 && n[0] % 32 == 0)
+            std::fprintf(stderr, "glm multi: snapshot copies (%s): %llu saves, %.2f ms each (copies %.2f); %llu "
+                         "restores, %.2f ms each (copies %.2f)\n",
+                         Glm5Model::snap_host_setting() ? "pinned RAM, MAYA_GLM_SNAP_HOST" : "VRAM",
+                         (unsigned long long) n[0], wall_ms[0] / (double) n[0], copy_ms[0] / (double) n[0],
+                         (unsigned long long) n[1], n[1] ? wall_ms[1] / (double) n[1] : 0.0,
+                         n[1] ? copy_ms[1] / (double) n[1] : 0.0);
+    }
+};
+SnapTiming& snap_timing() {
+    static SnapTiming t;
+    return t;
+}
+}  // namespace
+
+// both halves' copies are queued first and waited for after, so the cards copy at once (each over its own link when
+// the snapshots are in pinned RAM)
 bool Glm5Model::snapshot_save() {
     ckpt_join();   // (ckpt_save_snapshot may still be copying the snapshot this overwrites)
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+    SnapTiming& T = snap_timing();
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t h = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get(), ++h) {
         if (m->fast_ == nullptr) return false;
         const Glm5Geometry& g = m->g_;
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
@@ -6723,6 +6764,7 @@ bool Glm5Model::snapshot_save() {
             cudaSetDevice(dev_);
             return false;
         }
+        if (T.on) cudaEventRecord(T.at(h).first, m->fast_->cs);
         int k = 0;
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
@@ -6730,33 +6772,56 @@ bool Glm5Model::snapshot_save() {
                                 cudaMemcpyDefault, m->fast_->cs);
         m->snap_pos_ = pos_;
         m->snap_pool_copy(false);
+        if (T.on) cudaEventRecord(T.at(h).second, m->fast_->cs);
+    }
+    bool ok = true;
+    double copy = 0;
+    h = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get(), ++h) {
+        cudaSetDevice(m->dev_);
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_pool_ == nullptr && !m->dsa_layers().empty()) {
-            cudaSetDevice(dev_);
-            return false;
-        }
+        if (m->snap_pool_ == nullptr && !m->dsa_layers().empty()) ok = false;
+        float ms = 0.0f;
+        if (T.on && cudaEventElapsedTime(&ms, T.at(h).first, T.at(h).second) == cudaSuccess)
+            copy = std::max(copy, (double) ms);
     }
     cudaSetDevice(dev_);
-    return true;
+    if (T.on && ok)
+        T.add(0, copy, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
 
 bool Glm5Model::snapshot_restore() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || m->snap_pos_ < 0) return false;
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+    SnapTiming& T = snap_timing();
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t h = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get(), ++h) {
         const Glm5Geometry& g = m->g_;
         const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
         cudaSetDevice(m->dev_);
+        if (T.on) cudaEventRecord(T.at(h).first, m->fast_->cs);
         int k = 0;
         for (int il = m->l0_; il < m->l1_; ++il)
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], m->snap_ + (size_t) k++ * run, run * sizeof(float),
                                 cudaMemcpyDefault, m->fast_->cs);
         m->snap_pool_copy(true);
+        if (T.on) cudaEventRecord(T.at(h).second, m->fast_->cs);
+    }
+    double copy = 0;
+    h = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get(), ++h) {
+        cudaSetDevice(m->dev_);
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
         m->mtp_hx_pos_ = -1;   // (head_x is the continuation's, not the snapshot's)
+        float ms = 0.0f;
+        if (T.on && cudaEventElapsedTime(&ms, T.at(h).first, T.at(h).second) == cudaSuccess)
+            copy = std::max(copy, (double) ms);
     }
+    if (T.on) T.add(1, copy, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     // the drafter's positions from here on belong to the previous continuation
     if (cap_d_ != nullptr) cap_d_->reset(pos_);
     cudaSetDevice(dev_);
