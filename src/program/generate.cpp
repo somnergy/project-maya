@@ -3045,6 +3045,11 @@ static int glm_pack_generate(const Options& o) {
             int32_t last = -1, forced_unused = -1;
             bool interrupted = false;
             int64_t n_spec = 0;
+            // (STRATA_GLM_MTP_LEND_SKIP_READ: the NextN cache entries its reads left out while lent, before it drafts)
+            if (mtp_lend && !model.mtp_catchup(g.ctx, err)) {
+                multi_fail(err);
+                return;
+            }
             const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;

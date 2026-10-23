@@ -3980,7 +3980,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (mtp_il_ >= 0 && next_ids != nullptr) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
-        if (Tv > 0) {
+        // (STRATA_GLM_MTP_LEND_SKIP_READ: catch-up entries at p0 or after are this read's to write now)
+        mtp_catch_drop(cur_seq_, p0);
+        if (Tv > 0 && mtp_skip_fill()) {
+            // ... and while the NextN block's slots are lent nothing drafts: the fill is left out; the newest of these
+            // rows keep their hidden state for the catch-up before this conversation drafts again
+            if (F->mcatch.W > 0) {
+                Carve c{S->uni};
+                float* hb = c.take<float>((size_t) std::min(Tv, F->mcatch.W) * E);
+                mtp_catch_keep(p0, Tv, next_ids, S->R, hb, s);
+            } else {
+                F->mcatch.skipped += (uint64_t) Tv;
+            }
+            S->mark("mtp_skip", s);
+        } else if (Tv > 0) {
             const auto& Ly = F->L[(size_t) mtp_il_];
             const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {

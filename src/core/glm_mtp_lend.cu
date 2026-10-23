@@ -21,9 +21,11 @@
 // elsewhere, and no draft runs (spec_ready() is false; the scheduler's windows wait for mtp_lent() to clear).  Both
 // switches are synchronous on this part, called with every part idle (the scheduler drains first).
 #include "glm_fast_state.hpp"
+#include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_lend.hpp"
 #include "strata/core/tier_policy.hpp"
+#include "strata/kernels/glm_batch.hpp"
 
 #include <cuda_runtime.h>
 
@@ -145,6 +147,7 @@ bool Glm5Model::mtp_lend_setup(const std::vector<std::vector<double>>& share, st
     M.layers = layers;
     M.key.assign((size_t) PD.n_main, -1);
     M.tick.assign((size_t) PD.n_main, 0);
+    mtp_catch_setup();
     const MtpLendPolicy& pol = mtp_lend_policy();
     std::fprintf(stderr, "glm mtp lend: CUDA%d the draft layer's %d main slots (%.2f GB) serve %d slots of %d trunk layers "
                          "(%d-%d a layer) while drafting is off (MAYA_GLM_MTP_LEND): lent after %.0f s with more than "
@@ -155,9 +158,135 @@ bool Glm5Model::mtp_lend_setup(const std::vector<std::vector<double>>& share, st
     return true;
 }
 
+// STRATA_GLM_MTP_LEND_SKIP_READ: reads leave the NextN cache fill out while lent; the pinned rows for the catch-up
+void Glm5Model::mtp_catch_setup() {
+    FastState* F = fast_;
+    const MtpLendExtra& X = mtp_lend_extra();
+    if (!X.skip_read || mtp_il_ < 0) return;
+    auto& K = F->mcatch;
+    K.on = true;
+    K.W = X.catchup;
+    const int ns = std::max(1, seq_count());
+    const size_t E = (size_t) g_.n_embd;
+    if (K.W > 0) {
+        const size_t bytes = (size_t) ns * (size_t) K.W * E * sizeof(float);
+        if (cudaHostAlloc((void**) &K.h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &K.h_d, K.h, 0) != cudaSuccess) {
+            cudaGetLastError();
+            if (K.h != nullptr) cudaFreeHost(K.h);
+            K.h = K.h_d = nullptr;
+            std::fprintf(stderr, "glm mtp lend: CUDA%d %.2f GB of pinned RAM for the catch-up rows did not allocate - the "
+                                 "NextN cache entries reads leave out while lent stay as they were\n",
+                         dev_, (double) bytes / 1073741824.0);
+            K.W = 0;
+        } else {
+            K.ring.assign((size_t) ns, MtpCatchRing{});
+            for (auto& r : K.ring) r.init(K.W);
+        }
+    }
+    char tail[160];
+    if (K.W > 0)
+        std::snprintf(tail, sizeof tail, "the newest %d positions a conversation fill it before it drafts again "
+                                         "(MAYA_GLM_MTP_LEND_CATCHUP, %.0f MB pinned)",
+                      K.W, (double) ns * K.W * E * sizeof(float) / 1048576.0);
+    else
+        std::snprintf(tail, sizeof tail, "none filled later (MAYA_GLM_MTP_LEND_CATCHUP=0)");
+    std::fprintf(stderr, "glm mtp lend: CUDA%d prompt reads leave the NextN cache fill out while its slots are lent "
+                         "(MAYA_GLM_MTP_LEND_SKIP_READ); %s\n", dev_, tail);
+}
+
+bool Glm5Model::mtp_skip_fill() const {
+    const FastState* F = fast_;
+    return F != nullptr && F->mcatch.on && F->ml.on && F->ml.lent;
+}
+
+void Glm5Model::mtp_catch_drop(int sq, int64_t from) {
+    FastState* F = fast_;
+    if (F == nullptr || F->mcatch.W <= 0 || sq < 0 || sq >= (int) F->mcatch.ring.size()) return;
+    F->mcatch.ring[(size_t) sq].drop_from(from);
+}
+
+// the chunk's rows [0, Tv) at p0 .. p0 + Tv - 1 had their NextN cache entries left out: the newest W of them keep the
+// trunk's hidden state (head_rows', the NextN block's input) in the pinned rows - copies on this stream, so the
+// catch-up's kernels on it read them after they landed
+void Glm5Model::mtp_catch_keep(int64_t p0, int Tv, const int32_t* next_ids, const float* R, float* hbuf,
+                               cudaStream_t s) {
+    FastState* F = fast_;
+    auto& K = F->mcatch;
+    K.skipped += (uint64_t) Tv;
+    if (K.W <= 0 || Tv <= 0 || cur_seq_ < 0 || cur_seq_ >= (int) K.ring.size()) return;
+    auto& Q = K.ring[(size_t) cur_seq_];
+    const int keep = std::min(Tv, K.W), t0 = Tv - keep;
+    const size_t E = (size_t) g_.n_embd;
+    strata::kernels::glmb::head_rows(R + (size_t) t0 * 4 * E, w_.at("output_norm.weight"), g_.norm_eps, keep,
+                                     (int) E, hbuf, s);
+    int seg[2][3];
+    const int ns = Q.append(p0 + t0, keep, next_ids + t0, seg);
+    for (int i = 0; i < ns; ++i)
+        cudaMemcpyAsync(K.h + ((size_t) cur_seq_ * (size_t) K.W + (size_t) seg[i][0]) * E, hbuf + (size_t) seg[i][2] * E,
+                        (size_t) seg[i][1] * E * sizeof(float), cudaMemcpyDeviceToHost, s);
+}
+
+// conversation sq's left-out entries into its NextN cache (this part carries the block, owned again): the window
+// path's cache rows (mtpw_cache_rows: eh_proj, the attention norm, kv_a, the indexer's key and gate - KV streaming's
+// hook where the cache is streamed), mtpc's rows at a time, oldest first.  The pinned rows are read in place.
+bool Glm5Model::mtp_catchup_part(int sq, std::string& err) {
+    FastState* F = fast_;
+    if (F == nullptr) return true;
+    auto& K = F->mcatch;
+    if (!K.on || K.W <= 0 || sq < 0 || sq >= (int) K.ring.size() || K.ring[(size_t) sq].count == 0) return true;
+    if (F->ml.lent || F->mtpc.cap < 1) return true;   // (the callers draft: owned - never expected)
+    auto& Q = K.ring[(size_t) sq];
+    const auto t0 = std::chrono::steady_clock::now();
+    RowSeq rb;
+    mtpw_bind(sq, rb);
+    const size_t E = (size_t) g_.n_embd;
+    int n_fill = 0;
+    bool ok = true;
+    Q.runs(rb.p, F->mtpc.cap, [&](int i0, int64_t p, int n) {
+        if (!ok) return;
+        // (mtpc's pinned embedding rows are reused: the previous run's copy out of them must have landed)
+        ok = glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp catch-up", err) &&
+             mtpw_cache_rows(rb, p, n, K.h_d + ((size_t) sq * (size_t) K.W + (size_t) i0) * E, Q.next.data() + i0,
+                             F->mtpc.emb_h, err);
+        n_fill += n;
+    });
+    const uint64_t lost = Q.lost;
+    Q.clear();
+    Q.lost = 0;
+    if (!ok || !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mtp catch-up", err)) return false;
+    const double ms = 1000.0 * secs(t0, std::chrono::steady_clock::now());
+    K.filled += (uint64_t) n_fill;
+    ++K.fills;
+    K.fill_ms += ms;
+    std::fprintf(stderr, "glm mtp lend: CUDA%d conversation %d: %d NextN cache entries its reads left out while lent "
+                         "filled in %.1f ms before it drafts (%llu older ones not kept)\n",
+                 dev_, sq, n_fill, ms, (unsigned long long) lost);
+    return true;
+}
+
+bool Glm5Model::mtp_catchup(int sq, std::string& err) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || !m->fast_->mcatch.on) continue;
+        cudaSetDevice(m->dev_);
+        const bool ok = m->mtp_catchup_part(sq, err);
+        cudaSetDevice(dev_);
+        return ok;
+    }
+    return true;
+}
+
 void Glm5Model::mtp_lend_free() {
     FastState* F = fast_;
     if (F == nullptr) return;
+    auto& K = F->mcatch;
+    if (K.on && K.skipped > 0)
+        std::fprintf(stderr, "glm mtp lend: CUDA%d reads left %llu NextN cache entries out while lent; %llu filled by "
+                             "%llu catch-ups in %.0f ms\n", dev_, (unsigned long long) K.skipped,
+                     (unsigned long long) K.filled, (unsigned long long) K.fills, K.fill_ms);
+    if (K.h != nullptr) cudaFreeHost(K.h);
+    K.h = K.h_d = nullptr;
+    K.on = false;
     auto& M = F->ml;
     if (M.on && (M.lends > 0 || M.reclaims > 0)) {
         const auto now = std::chrono::steady_clock::now();

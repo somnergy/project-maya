@@ -4,6 +4,7 @@
 #pragma once
 
 #include "strata/core/glm_model.hpp"
+#include "strata/core/mtp_lend.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
@@ -614,6 +615,19 @@ struct Glm5Model::FastState {
         double lent_s = 0.0;         // seconds lent in all (to the last reclaim)
         std::chrono::steady_clock::time_point t_start = std::chrono::steady_clock::now(), t_lent{};
     } ml;
+    // STRATA_GLM_MTP_LEND_SKIP_READ (the part with the draft layer): a read while it is lent leaves the NextN cache fill
+    // out; per conversation the trunk's hidden states (head_rows') of the newest `W` positions it left out wait in h
+    // (pinned and mapped: the catch-up's kernels read them there), conversation s's at rows [s W, (s + 1) W), indexed
+    // by its ring.  They fill its NextN cache before it drafts again (src/core/glm_mtp_lend.cu, mtp_catchup_part).
+    struct MtpCatch {
+        bool on = false;               // skip the fill while lent
+        int W = 0;                     // positions kept a conversation (0: none, the entries stay as they were)
+        float* h = nullptr;            // pinned, n_seq * W * n_embd
+        float* h_d = nullptr;          // its device address
+        std::vector<strata::core::MtpCatchRing> ring;
+        uint64_t skipped = 0, filled = 0, fills = 0;   // positions left out, positions filled, catch-ups
+        double fill_ms = 0.0;
+    } mcatch;
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)
