@@ -200,6 +200,9 @@ struct DsaScoreRows {
     int n_pools[kMaxMvNt];
 };
 void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s);
+/// The pools a warp of dsa_score / dsa_score_rows for a bench (STRATA_GLM_DSA_SCORE_PPW otherwise; 1 = the original
+/// kernel, < 0 = back to the setting).  Every score is the same bits whatever the value.
+void dsa_score_config(int ppw);
 /// dsa_select of up to kMaxMvNt rows of different sequences (the batched rows) in one launch, a block a row: row r's
 /// scores, pools and cells as dsa_select's arguments - each row's cells dsa_select's
 struct DsaSelectRows {
