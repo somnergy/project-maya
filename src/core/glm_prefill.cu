@@ -22,6 +22,7 @@
 #include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/tier_policy.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -105,6 +106,16 @@ constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
+// the shortest call that prestages (STRATA_GLM_PRESTAGE_MIN_T, 256 at least; default kPreMinT): from ~512 tokens a
+// chunk routes nearly every expert of a layer, so a short read on a split - an agent's turn - can prestage too
+static int pre_min_t() {
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_PRESTAGE_MIN_T");
+        const int x = e != nullptr ? std::atoi(e) : kPreMinT;
+        return x >= 256 ? x : kPreMinT;
+    }();
+    return v;
+}
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
@@ -1540,7 +1551,7 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->w32 = c.take<float>((size_t) S->w32_elems);
     S->ws = c.take<uint8_t>(S->ws_bytes);
     S->gbuf = S->gbuf_bytes ? c.take<uint8_t>(S->gbuf_bytes) : nullptr;
-    S->pbuf = S->pbuf_bytes && Tn >= kPreMinT ? c.take<uint8_t>(S->pbuf_bytes) : nullptr;   // (a short prompt: none)
+    S->pbuf = S->pbuf_bytes && Tn >= pre_min_t() ? c.take<uint8_t>(S->pbuf_bytes) : nullptr;   // (a short prompt: none)
     Carve a{S->arena};
     S->R = a.take<float>(T * 4 * E);
     S->x = a.take<float>(T * E);
@@ -1585,6 +1596,11 @@ bool Glm5Model::prefill_lend(std::string& err) {
     // while a VRAM reserve big enough to matter on CUDA1 (it lends 3021 MB of a 3048 MB maximum) would halve its
     // chunk - which is exactly what the flatten-to-smallest rule then spreads to all four parts.
     const uint64_t dropped_before = S->dropped;
+    // (STRATA_GLM_MTP_LEND_BG: a reclaim whose experts are still on their way to the RAM tier finishes that step first -
+    // the prompt path finds an expert only in a VRAM slot it may read or a RAM slot that holds it, not in between)
+    if (F->ml.phase == 1 &&
+        (!glmfast::cuda_ok(cudaEventSynchronize(F->ml.ev), "glm mtp reclaim copies", err) || !mtp_reclaim_advance(err)))
+        return false;
     if (!lend_tail(S->need + kMmqSlab, S->moved, S->dropped, err)) return false;
     {
         const size_t base = (size_t) (S->region + S->need);
@@ -1652,19 +1668,13 @@ bool Glm5Model::vision_reclaim(std::string& err) {
         err = "the pool's tail is not free yet";
         return false;
     }
-    uint8_t* b = F->xpool;
-    for (int il = l0_; il < lt_; ++il) {
-        if (!F->L[(size_t) il].moe) continue;
-        auto& P = F->lp[(size_t) il];
-        P.xbase = b;
-        b += (size_t) (P.n - P.n_main) * P.stride;
-    }
+    tail_layout(F->xpool);   // (the layout fast_setup chose: STRATA_GLM_LEND_SPREAD)
     if (pf_ != nullptr && !prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
     {
         std::lock_guard<std::mutex> lk(F->mu);
         for (int il = l0_; il < lt_; ++il) {
             auto& P = F->lp[(size_t) il];
-            for (int s = P.n_main; s < P.n; ++s)
+            for (int s = P.n_main; s < P.n_tail; ++s)
                 if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
         }
     }
@@ -1676,7 +1686,8 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 
 // The tail's slots below xpool + limit leave the decode: a resident expert takes the slot of a colder main-slot
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
-bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
+// borrowed (STRATA_GLM_MTP_LEND's reclaim): the same for every borrowed slot [n_tail, n) instead (limit unused).
+bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err, bool borrowed) {
     FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
@@ -1689,7 +1700,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         return false;
     }
     const int NE = g_.n_expert;
-    F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
+    if (!borrowed) F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
     {
         std::lock_guard<std::mutex> lk(F->mu);
         int nu = 0;
@@ -1795,9 +1806,9 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
             });
             size_t ci = 0;
-            for (int s = P.n_main; s < P.n; ++s) {
+            for (int s = borrowed ? P.n_tail : P.n_main; s < (borrowed ? P.n : P.n_tail); ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) {
+                if (!borrowed && P.slot_ptr(s) >= F->xpool + limit) {
                     // ... and it is the first live byte of this layer's tail: what precedes it is a loan nobody uses
                     F->lend_end = std::min(F->lend_end, (size_t) P.slot_ptr(s));
                     continue;
@@ -1867,7 +1878,7 @@ bool Glm5Model::prefill_return(std::string& err) {
     std::lock_guard<std::mutex> lk(F->mu);
     for (int il = l0_; il < lt_; ++il) {
         auto& P = F->lp[(size_t) il];
-        for (int s = P.n_main; s < P.n; ++s)
+        for (int s = P.n_main; s < P.n_tail; ++s)
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
     S->lent = false;
@@ -2271,7 +2282,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const auto prestage = [&](int il) {
         S->pre_layer = -1;
         S->pre_e.clear();
-        if (S->pbuf == nullptr || T < kPreMinT || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
+        if (S->pbuf == nullptr || T < pre_min_t() || il >= l1_ || !F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0 ||
             (tail_skip && il == g.n_layers - 1))   // the skipped terminal FFN reads no experts
             return;
         const auto& Ly = F->L[(size_t) il];
@@ -2339,8 +2350,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the gate: the CPU lane is planned in only where PCIe moves an expert more than this many times slower than the
+    // lane computes one (STRATA_GLM_PREFILL_CPU_GATE, default 2: an expert's fixed cost on the CPU is about twice the
+    // one-token expert the start times); lower lets a card whose link is about twice the lane's speed share its experts
+    static const double pf_cpu_gate = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_CPU_GATE");
+        const double x = v != nullptr ? std::atof(v) : 2.0;
+        return x > 0.0 ? x : 2.0;
+    }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > pf_cpu_gate * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
@@ -2890,24 +2909,25 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     src = RC.base + (size_t) rs * RC.stride;
                 staged.push_back(Staged{e, src, dev});
             }
-            // the prompt's routing feeds the LFU counts the decode's tiers evict by
+            // the prompt's routing feeds the LFU counts the decode's tiers evict by (STRATA_GLM_PROMPT_COUNTS: with
+            // a weight, 0 = not at all; tier_policy.hpp)
+            const strata::core::TierPolicy& tp = strata::core::tier_policy();
             uint64_t ev = 0;
             for (int e = 0; e < NE; ++e) {
                 const int cnt = std::abs(S->h_counts[e]);
                 if (cnt == 0) continue;
+                const uint64_t wc = strata::core::tier_prompt_count((uint64_t) cnt, tp.prompt_w);
                 uint32_t& cc = F->cnt[(size_t) il * NE + e];
-                cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
-                ev += (uint64_t) cnt;
+                cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + wc, 1u << 24);
+                ev += wc;
                 uint32_t& uu = F->usage[(size_t) il * NE + e];
                 uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) cnt, 1u << 30);
                 if (uu >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
             }
-            F->cnt_events += ev;
-            while (F->cnt_events >= 32768) {
-                F->cnt_events -= 32768;
-                for (auto& cc : F->cnt) cc >>= 1;
-            }
+            const int nh = strata::core::tier_halvings(F->cnt_events, ev, tp.half);
+            if (nh > 0)
+                for (auto& cc : F->cnt) cc = strata::core::tier_halved(cc, nh);
             auto& lc = S->last_cnt[(size_t) il];
             lc.resize((size_t) NE);
             for (int e = 0; e < NE; ++e) lc[(size_t) e] = std::abs(S->h_counts[e]);
@@ -3965,7 +3985,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (mtp_il_ >= 0 && next_ids != nullptr) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
-        if (Tv > 0) {
+        // (STRATA_GLM_MTP_LEND_SKIP_READ: catch-up entries at p0 or after are this read's to write now)
+        mtp_catch_drop(cur_seq_, p0);
+        if (Tv > 0 && mtp_skip_fill()) {
+            // ... and while the NextN block's slots are lent nothing drafts: the fill is left out; the newest of these
+            // rows keep their hidden state for the catch-up before this conversation drafts again
+            if (F->mcatch.W > 0) {
+                Carve c{S->uni};
+                float* hb = c.take<float>((size_t) std::min(Tv, F->mcatch.W) * E);
+                mtp_catch_keep(p0, Tv, next_ids, S->R, hb, s);
+            } else {
+                F->mcatch.skipped += (uint64_t) Tv;
+            }
+            S->mark("mtp_skip", s);
+        } else if (Tv > 0) {
             const auto& Ly = F->L[(size_t) mtp_il_];
             const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
             if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
