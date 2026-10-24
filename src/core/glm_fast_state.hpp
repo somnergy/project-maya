@@ -4,6 +4,7 @@
 #pragma once
 
 #include "strata/core/glm_model.hpp"
+#include "strata/core/mtp_lend.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
@@ -15,6 +16,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -501,19 +503,34 @@ struct Glm5Model::FastState {
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).
+    // STRATA_GLM_LEND_SPREAD=1 lays the tail out slot by slot across the layers instead (tail slot t of every layer,
+    // then t + 1 ...: xstep = one slot of every layer), so a prompt that borrows the region's front takes a slot or two
+    // from every layer rather than the whole tails of the first layers (tier_policy.hpp, tier_tail_layout).
+    // STRATA_GLM_MTP_LEND=1: slots [n_tail, n) are BORROWED - at bptr[s - n_tail], inside the draft layer's main slots
+    // (one block of the pool on the split's last part) and, with STRATA_GLM_MTP_LEND_MORE, MTP's other buffers on any
+    // part (src/core/glm_mtp_lend.cu).  kLent while MTP holds that memory, ordinary slots of this layer while it is lent
+    // to the trunk.  Without it n_tail == n.
     struct LayerPool {
         uint8_t* base = nullptr;
         uint8_t* xbase = nullptr;
+        std::vector<uint8_t*> bptr;   // the borrowed slots' addresses
         size_t stride = 0;
-        int n = 0, n_main = 0;
+        size_t xstep = 0;   // a tail slot to the next (0: stride, the layer's tail contiguous)
+        int n = 0, n_main = 0, n_tail = 0;
+        size_t tail_step() const { return xstep != 0 ? xstep : stride; }
         uint8_t* slot_ptr(int s) const {
-            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * stride;
+            return s < n_main   ? base + (size_t) s * stride
+                   : s < n_tail ? xbase + (size_t) (s - n_main) * tail_step()
+                                : bptr[(size_t) (s - n_tail)];
         }
         int slot_index(unsigned long long p) const {
             const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
             if (p >= b0 && p < b0 + (unsigned long long) n_main * stride) return (int) ((p - b0) / stride);
-            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * stride)
-                return n_main + (int) ((p - x0) / stride);
+            const unsigned long long xs = (unsigned long long) tail_step();
+            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n_tail - n_main) * xs && (p - x0) % xs == 0)
+                return n_main + (int) ((p - x0) / xs);
+            for (size_t k = 0; k < bptr.size(); ++k)   // (a few dozen at most)
+                if ((unsigned long long) bptr[k] == p) return n_tail + (int) k;
             return -1;
         }
         std::vector<int> key;        // slot -> expert, -1 none
@@ -581,6 +598,61 @@ struct Glm5Model::FastState {
     // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
     // need, lend_end) is a loan the layout did not use - where the prompt path's MMQ scratch lives (mmq::pool_slab)
     size_t lend_end = 0;
+    // STRATA_GLM_MTP_LEND (src/core/glm_mtp_lend.cu): the draft layer's main slots (region, one block) lent to this part's
+    // trunk layers as their borrowed slots while drafting is off.  Lent: the draft layer's slot map as it was (key and
+    // recency per main slot; -1 none) and its bytes in snap (pinned) - put back verbatim when it is reclaimed.
+    // STRATA_GLM_MTP_LEND_MORE: further regions of this part (`more`): the windows' buffers (scratch: nothing to keep)
+    // and the NextN block's dense weights / device token_embd (weights: back from `copy`, pinned, taken at the start).
+    struct MtpLend {
+        bool on = false, lent = false;
+        bool broken = false;         // a switch failed: no more switches, and lent stays true (nothing drafts)
+        int il = -1;                 // the draft layer (-1: none on this part - only `more` regions lent)
+        uint8_t* region = nullptr;   // lp[il].base
+        size_t bytes = 0;            // lp[il].n_main * lp[il].stride
+        uint8_t* snap = nullptr;     // pinned, bytes
+        struct More {
+            uint8_t* p = nullptr;
+            size_t bytes = 0;
+            uint8_t* copy = nullptr;   // pinned copy (weights); null: scratch
+            const char* what = "";
+        };
+        std::vector<More> more;
+        // STRATA_GLM_MTP_LEND_BG: a reclaim in the background - phase 1: the borrowed slots' experts on their way to the
+        // RAM tier (still live in VRAM), 2: MTP's bytes on their way back (the tables send those experts' routes to the
+        // RAM tier); `cp` carries both, `ev` marks the phase's copies
+        int phase = 0;
+        struct Park {
+            int il, slot, key, rclass, rslot;
+        };
+        std::vector<Park> parks;
+        cudaStream_t cp = nullptr;
+        cudaEvent_t ev = nullptr, ev0 = nullptr;   // (ev0: the copies' start, for their time)
+        int polls = 0;
+        double park_ms = -1.0;
+        std::chrono::steady_clock::time_point t_bg0{}, t_flip{};
+        double stall_ms = 0.0;      // this reclaim's host-blocking time so far
+        uint64_t bg_dropped = 0;    // its experts that found no RAM slot (disk only)
+        std::string why;
+        int slots = 0, layers = 0;   // the borrowed slots, the layers they went to
+        std::vector<int> key;
+        std::vector<uint64_t> tick;
+        uint64_t lends = 0, reclaims = 0;
+        double lent_s = 0.0;         // seconds lent in all (to the last reclaim)
+        std::chrono::steady_clock::time_point t_start = std::chrono::steady_clock::now(), t_lent{};
+    } ml;
+    // STRATA_GLM_MTP_LEND_SKIP_READ (the part with the draft layer): a read while it is lent leaves the NextN cache fill
+    // out; per conversation the trunk's hidden states (head_rows') of the newest `W` positions it left out wait in h
+    // (pinned and mapped: the catch-up's kernels read them there), conversation s's at rows [s W, (s + 1) W), indexed
+    // by its ring.  They fill its NextN cache before it drafts again (src/core/glm_mtp_lend.cu, mtp_catchup_part).
+    struct MtpCatch {
+        bool on = false;               // skip the fill while lent
+        int W = 0;                     // positions kept a conversation (0: none, the entries stay as they were)
+        float* h = nullptr;            // pinned, n_seq * W * n_embd
+        float* h_d = nullptr;          // its device address
+        std::vector<strata::core::MtpCatchRing> ring;
+        uint64_t skipped = 0, filled = 0, fills = 0;   // positions left out, positions filled, catch-ups
+        double fill_ms = 0.0;
+    } mcatch;
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)
@@ -588,9 +660,21 @@ struct Glm5Model::FastState {
                   kRHelper = 7 };   // helper-owned UMA weights: readable by prefill, never a RAM-tier victim
     struct RamClass {
         size_t stride = 0;
-        uint8_t* base = nullptr;
+        uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
+        // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
+        int per_part = 0;
+        std::vector<uint8_t*> parts;
+        uint8_t* slot(size_t s) const {
+            return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
+        }
+        size_t part_slots(size_t i) const {   // the slots of piece i
+            return per_part > 0 ? std::min((size_t) per_part, (size_t) n - i * (size_t) per_part) : (size_t) n;
+        }
+        size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
+        uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /

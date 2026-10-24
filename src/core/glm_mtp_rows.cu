@@ -86,6 +86,13 @@ struct Glm5Model::MtpRows {
     std::vector<int32_t> d_tok, d_out;
     cudaEvent_t ev_draft = nullptr;
     bool d_pending = false;
+    // STRATA_GLM_MTP_LEND_MORE: every device buffer above (and the recurrent-state copies it allocates) carved from one
+    // block, which the lending hands to the expert tiers while nothing drafts
+    uint8_t* arena = nullptr;
+    size_t arena_bytes = 0, arena_used = 0;
+    bool carved(const void* p) const {
+        return arena != nullptr && (const uint8_t*) p >= arena && (const uint8_t*) p < arena + arena_bytes;
+    }
 };
 
 int Glm5Model::multi_mtp_setting() {
@@ -128,7 +135,41 @@ bool Glm5Model::mtpw_alloc(std::string& err) {
     const bool first = l0_ == 0, last = l1_ == g.n_layers;
     cudaSetDevice(dev_);
     uint64_t dev_bytes = 0, pin_bytes = 0;
+    const auto up = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
+    const size_t bak_bytes = (size_t) M->n_kda * M->run * sizeof(float);
+    // STRATA_GLM_MTP_LEND_MORE: one block for them all (their sizes first)
+    if (strata::core::mtp_lend_policy().on && strata::core::mtp_lend_extra().more) {
+        size_t need = 0;
+        for (int s = 0; s < n; ++s) {
+            const float* bak = s == cur_seq_ ? kda_bak_ : seq_[(size_t) s].kda_bak;
+            if (bak_bytes > 0 && bak == nullptr) need += up(bak_bytes);
+            if (M->n_kda > 0) need += up((size_t) M->n_kda * M->kin_layer * sizeof(float));
+            if (last) need += up((size_t) M->W * E * sizeof(float)) + up(E * sizeof(float));
+        }
+        need += up((size_t) rows_max() * 2 * hcE * sizeof(float));
+        if (last)
+            need += 2 * up((size_t) rows_max() * E * sizeof(float)) + up((size_t) rows_max() * (2 * E / 32) * 36);
+        if (cudaMalloc((void**) &M->arena, need) != cudaSuccess) {
+            cudaGetLastError();
+            M->arena = nullptr;
+            std::fprintf(stderr, "glm multi mtp: CUDA%d the windows' buffers as one block (%.0f MB) did not allocate - "
+                                 "separate ones, which MAYA_GLM_MTP_LEND_MORE cannot lend\n", dev_,
+                         (double) need / 1048576.0);
+        } else {
+            M->arena_bytes = need;
+        }
+    }
     const auto dmalloc = [&](void** p, size_t b) {
+        if (M->arena != nullptr) {
+            if (M->arena_used + up(b) > M->arena_bytes) {
+                *p = nullptr;
+                return false;
+            }
+            *p = M->arena + M->arena_used;
+            M->arena_used += up(b);
+            dev_bytes += b;
+            return true;
+        }
         if (cudaMalloc(p, b) != cudaSuccess) {
             cudaGetLastError();
             *p = nullptr;
@@ -164,7 +205,6 @@ bool Glm5Model::mtpw_alloc(std::string& err) {
     M->dh.assign((size_t) n, nullptr);
     M->p0.assign((size_t) n, 0);
     M->cnt.assign((size_t) n, 0);
-    const size_t bak_bytes = (size_t) M->n_kda * M->run * sizeof(float);
     for (int s = 0; s < n; ++s) {
         // the recurrent states' copy: the spec path's own where it took one (the same layout), else here
         float*& bak = s == cur_seq_ ? kda_bak_ : seq_[(size_t) s].kda_bak;
@@ -197,8 +237,8 @@ bool Glm5Model::mtpw_alloc(std::string& err) {
         return fail("the drafts' event");
     }
     std::fprintf(stderr, "glm multi mtp: CUDA%d windows of %d rows (%d drafts) for %d conversations, %d rows a group: "
-                         "%.0f MB of VRAM, %.1f MB pinned\n", dev_, M->W, M->W - 1, n, rows_max(),
-                 (double) dev_bytes / 1048576.0, (double) pin_bytes / 1048576.0);
+                         "%.0f MB of VRAM%s, %.1f MB pinned\n", dev_, M->W, M->W - 1, n, rows_max(),
+                 (double) dev_bytes / 1048576.0, M->arena != nullptr ? " (one block)" : "", (double) pin_bytes / 1048576.0);
     return true;
 }
 
@@ -217,10 +257,29 @@ bool Glm5Model::mtpw_setup(std::string& err) {
     return true;
 }
 
+bool Glm5Model::mtpw_carved(const void* p) const { return mtpw_ != nullptr && mtpw_->carved(p); }
+
+std::pair<uint8_t*, size_t> Glm5Model::mtpw_block() const {
+    if (mtpw_ == nullptr || mtpw_->arena == nullptr) return {nullptr, 0};
+    return {mtpw_->arena, mtpw_->arena_bytes};
+}
+
 void Glm5Model::mtpw_destroy() {
     MtpRows* M = mtpw_;
     if (M == nullptr) return;
     cudaSetDevice(dev_);
+    if (M->arena != nullptr) {   // (STRATA_GLM_MTP_LEND_MORE: one block; the recurrent-state copies in it are not freed alone)
+        if (M->carved(kda_bak_)) kda_bak_ = nullptr;
+        for (auto& c : seq_)
+            if (M->carved(c.kda_bak)) c.kda_bak = nullptr;
+        M->kin.assign(M->kin.size(), nullptr);
+        M->hx.assign(M->hx.size(), nullptr);
+        M->dh.assign(M->dh.size(), nullptr);
+        M->res = M->demb = M->mh = nullptr;
+        M->catq = nullptr;
+        cudaFree(M->arena);
+        M->arena = nullptr;
+    }
     for (int s = 0; s < M->n_seq; ++s) {
         if (M->kin[(size_t) s]) cudaFree(M->kin[(size_t) s]);   // (the recurrent-state copies: with the sequences')
         for (float* p : {M->emb_h[(size_t) s], M->hop_h[(size_t) s], M->cemb_h[(size_t) s], M->demb_h[(size_t) s]})
@@ -773,6 +832,8 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         const int sq = seqs[c];
         const int k = keep[c];
         const int64_t p0 = M->p0[(size_t) sq];   // (the window's start; the commit set the position to p0 + k)
+        // (STRATA_GLM_MTP_LEND_SKIP_READ: what its reads left out of the cache while lent, before its first drafts)
+        if (!L->mtp_catchup_part(sq, err)) return false;
         if (draft_rows) {
             L->mtpw_bind(sq, base[c]);
             if (k > 1 && !L->mtpw_cache_rows(base[c], p0, k - 1, M->hx[(size_t) sq], written + at,

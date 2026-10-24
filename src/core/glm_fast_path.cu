@@ -18,6 +18,8 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/mtp_lend.hpp"
+#include "strata/core/tier_policy.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -623,6 +625,35 @@ static void* fa_take_b(uint8_t*& at, size_t bytes) {
 namespace {
 void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3);   // (after X3Rows)
 }  // namespace
+
+// The tail slots' addresses (FastState::LayerPool::xbase / xstep): layer-major as before, or slot-major across the
+// layers with STRATA_GLM_LEND_SPREAD (tier_policy.hpp).  fast_setup and vision_reclaim lay the region out with it.
+void Glm5Model::tail_layout(uint8_t* region) {
+    FastState* F = fast_;
+    std::vector<size_t> strides;
+    std::vector<int> tails, ils;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        const auto& P = F->lp[(size_t) il];
+        strides.push_back(P.stride);
+        tails.push_back(P.n_tail - P.n_main);
+        ils.push_back(il);
+    }
+    const strata::core::TailLayout lay =
+        strata::core::tier_tail_layout(strides, tails, strata::core::tier_policy().lend_spread);
+    for (size_t k = 0; k < ils.size(); ++k) {
+        auto& P = F->lp[(size_t) ils[k]];
+        P.xbase = region + lay.off[k];
+        P.xstep = lay.step;
+    }
+    static bool said[16] = {};
+    if (lay.spread && dev_ >= 0 && dev_ < 16 && !said[dev_]) {
+        said[dev_] = true;
+        std::fprintf(stderr, "glm fast: CUDA%d the pool's tail laid out slot by slot across %zu layers (MAYA_GLM_LEND_SPREAD): "
+                             "a prompt borrows a slot or two of every layer, not the first layers' whole tails\n",
+                     dev_, ils.size());
+    }
+}
 
 bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
@@ -1259,6 +1290,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
+        std::vector<std::vector<double>> lend_share;   // (STRATA_GLM_MTP_LEND: the shares, for the borrowed slots)
         // When the APU can hold every expert, keep exactly that many slots in each
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
@@ -1310,6 +1342,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool all = true;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe && share[(size_t) il].empty()) all = false;
+            if (all && strata::core::mtp_lend_policy().on) lend_share = share;
             if (all) {
                 const int cap = g.n_expert + gf::kSpares;
                 // the floor: a route's experts, the spares and the lendable tail, +16 when the budget has room for
@@ -1420,6 +1453,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
+            P.n_tail = nl;
             P.base = b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
@@ -1427,14 +1461,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             b += (size_t) P.n_main * P.stride;
             F->pool_slots += nl;
         }
+        // STRATA_GLM_MTP_LEND: the draft layer's main slots as borrowed slots of the trunk layers (kLent until lent)
+        if (strata::core::mtp_lend_policy().on && !mtp_lend_setup(lend_share, err)) return false;
         uint8_t* xregion = F->xpool;
-        b = xregion;
-        for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe) continue;
-            auto& P = F->lp[(size_t) il];
-            P.xbase = b;
-            b += (size_t) k_extra * P.stride;
-        }
+        tail_layout(xregion);   // (STRATA_GLM_LEND_SPREAD: slot-major across the layers)
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
             std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "
@@ -1451,7 +1481,17 @@ bool Glm5Model::fast_setup(std::string& err) {
                      F->complete ? (" - complete: every expert, " + std::to_string(gf::kSpares) + " spares and " +
                                     std::to_string(k_extra) + " lendable slots a layer").c_str()
                                  : "");
-        if (getenv("STRATA_GLM_TIMING") != nullptr) {
+        {   // the tier rules in use (tier_policy.hpp), when any is not the default
+            const strata::core::TierPolicy& tp = strata::core::tier_policy();
+            if (tp.half != 32768 || tp.prompt_w != 1.0 || tp.swap_any)
+                std::fprintf(stderr, "glm fast: CUDA%d tier counts halved every %llu events (MAYA_GLM_COUNT_HALF), a "
+                                     "prompt's routing counted x%.2f (MAYA_GLM_PROMPT_COUNTS), background swaps %s "
+                                     "(MAYA_GLM_PROMOTE_SWAP)\n",
+                             dev_, (unsigned long long) tp.half, tp.prompt_w,
+                             tp.swap_any ? "with any CPU-lane plan" : "with the all-CPU plan only");
+        }
+        // (a route log's replay needs each layer's slots: printed with it too)
+        if (getenv("STRATA_GLM_TIMING") != nullptr || getenv("STRATA_GLM_ROUTE_LOG") != nullptr) {
             std::string sl;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe) sl += std::to_string(il) + ":" + std::to_string(nsl[(size_t) il]) + " ";
@@ -1639,9 +1679,48 @@ bool Glm5Model::fast_setup(std::string& err) {
             const double f = (double) std::max<int64_t>(0, pin_left - (int64_t) kPinRoom) / (double) std::max<int64_t>(1, planned);
             return (int64_t) (f * (double) cls_n[c]);
         };
+        // a class pinned in pieces of at most STRATA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
+        // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
+        // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
+        // the start failed (#417)
+        static const int64_t piece_mb = getenv("STRATA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("STRATA_GLM_PIN_PIECE_MB"))
+#ifdef _WIN32
+                                                                          : 1024;
+#else
+                                                                          : 0;
+#endif
+        const auto pin_tier = [&](FastState::RamClass& R, int64_t n) -> void* {
+            if (R.per_part <= 0) {
+                void* q = nullptr;
+                return pin_alloc(&q, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess ? q : nullptr;
+            }
+            R.parts.clear();
+            for (int64_t s = 0; s < n; s += R.per_part) {
+                void* q = nullptr;
+                const size_t bytes = (size_t) std::min<int64_t>(R.per_part, n - s) * R.stride;
+                if (pin_alloc(&q, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                    for (size_t i = 0; i < R.parts.size(); ++i)
+                        pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+                    R.parts.clear();
+                    return nullptr;
+                }
+                R.parts.push_back((uint8_t*) q);
+            }
+            return R.parts.empty() ? nullptr : R.parts[0];
+        };
+        const auto unpin_tier = [&](FastState::RamClass& R, void* p, int64_t n) {
+            if (R.per_part <= 0) {
+                pin_free(p, (size_t) n * R.stride);
+                return;
+            }
+            for (size_t i = 0; i < R.parts.size(); ++i)
+                pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+            R.parts.clear();
+        };
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
             R.stride = cls_stride[c];
+            R.per_part = piece_mb > 0 ? (int) std::max<int64_t>(1, (piece_mb << 20) / (int64_t) R.stride) : 0;
             int64_t n = cls_n[c];
             const int64_t cap = cls_cap[c];
             const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
@@ -1652,9 +1731,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int tries = 0; n >= least; ++tries) {
                 if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
+                    R.per_part = 0;   // (one mapping)
                     break;
                 }
-                if (pin_alloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) {
+                if ((p = pin_tier(R, n)) != nullptr) {
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less
@@ -1664,7 +1744,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         break;
                     }
                     cudaGetLastError();
-                    pin_free(p, (size_t) n * R.stride);
+                    unpin_tier(R, p, n);
                 }
                 cudaGetLastError();
                 p = nullptr;
@@ -1733,7 +1813,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 if (F->L[(size_t) il].moe) {
                     const auto& P = F->lp[(size_t) il];
                     all += (double) g.n_expert * (double) P.stride;
-                    held += (double) std::min(g.n_expert, P.n) * (double) P.stride;
+                    held += (double) std::min(g.n_expert, P.n_tail) * (double) P.stride;
                 }
             prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
         }
@@ -1784,7 +1864,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool agree = true;   // arenas on different nodes: no line
             for (const auto& R : F->rc)
                 if (R.base != nullptr && R.n > 0) {
-                    const int node = win_arena_node(R.base, (size_t) R.n * R.stride);
+                    const int node = win_arena_node(R.base, R.part_slots(0) * R.stride);
                     if (node < 0) continue;
                     agree = agree && (tier_node < 0 || node == tier_node);
                     tier_node = node;
@@ -1869,7 +1949,8 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         return false;
     }
     std::vector<std::pair<void*, size_t>> regions;
-    for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
+    for (const auto& r : F->rc)
+        for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
     const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
     if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
     std::vector<int> ranked;
@@ -1897,7 +1978,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         if (R.stride > F->helper.available()) continue;
         const int rs = F->ram_of[(size_t) key];
-        const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* host = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
         if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
         if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
@@ -1955,7 +2036,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         const int il = s.in / g_.n_expert;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         const int rs = F->ram_of[(size_t) s.in];
-        const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* src = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
         if (!F->helper.replace(s.out, s.in, src, err)) return false;
         if (F->helper.integrated()) {
@@ -1968,7 +2049,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
                 R.tick[(size_t) dst] = F->clock;
                 F->ram_of[(size_t) s.out] = -1;
                 F->ram_of[(size_t) s.in] = dst;
-                const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
+                const unsigned long long zero = 0, ptr = (unsigned long long) (R.slot((size_t) dst));
                 if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
                                      "helper old RAM entry", err) ||
                     !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
@@ -2874,7 +2955,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     std::vector<const uint8_t*> cal_all;
     for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s)
         if (R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] / g.n_expert == il_cal)
-            cal_all.push_back(R.base + (size_t) s * R.stride);
+            cal_all.push_back(R.slot((size_t) s));
     if (cal_all.empty()) {   // nothing in RAM: the lane would never run (a complete pool: every expert in VRAM)
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane off: the RAM tier holds no expert\n", dev_);
         return true;
@@ -3499,7 +3580,8 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         auto& P = F->lp[(size_t) il];
-        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n, g.n_expert, gf::kSpares);
+        // (the borrowed slots past n_tail are the draft layer's memory at the start: STRATA_GLM_MTP_LEND)
+        const int nv = glmfast::warm_pool_slots(F->unified_memory, P.n_tail, g.n_expert, gf::kSpares);
         for (int j = 0; j < nv; ++j) {
             const int e = order[(size_t) il][(size_t) j];
             const int key = il * g.n_expert + e;
@@ -3529,8 +3611,8 @@ bool Glm5Model::fast_warm(std::string& err) {
             R.key[(size_t) s] = key;
             R.st[(size_t) s] = FastState::kRHold;
             F->ram_of[(size_t) key] = s;
-            th[N + (size_t) key] = (unsigned long long) (R.base + (size_t) s * R.stride);
-            jobs.push_back(Job{il, e, R.base + (size_t) s * R.stride, false});
+            th[N + (size_t) key] = (unsigned long long) (R.slot((size_t) s));
+            jobs.push_back(Job{il, e, R.slot((size_t) s), false});
             --rfree[(size_t) c];
             progress = true;
         }
@@ -3718,7 +3800,8 @@ void Glm5Model::fast_destroy() {
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
     for (auto& R : F->rc)
         if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
-        else if (R.base) cudaFreeHost(R.base);
+        else
+            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);
@@ -3753,6 +3836,7 @@ void Glm5Model::fast_destroy() {
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
+    mtp_lend_free();
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
@@ -4152,7 +4236,7 @@ void Glm5Model::fast_service() {
                 }
             }
             F->cnt_events += (uint64_t) K;
-            if (F->cnt_events >= 32768) {
+            if (F->cnt_events >= strata::core::tier_policy().half) {   // (STRATA_GLM_COUNT_HALF; 32768 as before)
                 F->cnt_events = 0;
                 for (auto& c : F->cnt) c >>= 1;
             }
@@ -4215,7 +4299,7 @@ void Glm5Model::fast_service() {
                     const int key = il * g.n_expert + ids[mi[m]];
                     int rs = F->ram_of[(size_t) key];
                     if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRLoad || R.st[(size_t) rs] == FastState::kRNew)) {
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if (R.st[(size_t) rs] == FastState::kRLoad) {
                             auto& ld = F->rload[(size_t) cls][(size_t) rs];
                             uint64_t v = ld.load(std::memory_order_acquire);
@@ -4252,7 +4336,7 @@ void Glm5Model::fast_service() {
                                 break;
                             }
                         if (draining) {
-                            dst[m] = R.base + (size_t) rs * R.stride;
+                            dst[m] = R.slot((size_t) rs);
                             continue;
                         }
                     }
@@ -4268,7 +4352,7 @@ void Glm5Model::fast_service() {
                         R.tick[(size_t) rs] = F->clock;
                         R.st[(size_t) rs] = ((promo >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
                         F->ram_of[(size_t) key] = ((promo >> mi[m]) & 1u) ? -1 : rs;
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if ((promo >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
                     } else {
                         dst[m] = F->stage[(size_t) m];
@@ -4583,7 +4667,7 @@ void Glm5Model::fast_ahead_reader() {
         auto& ld = F->rload[(size_t) j.rclass][(size_t) j.rslot];
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
-            uint8_t* blob = F->rc[(size_t) j.rclass].base + (size_t) j.rslot * F->rc[(size_t) j.rclass].stride;
+            uint8_t* blob = F->rc[(size_t) j.rclass].slot((size_t) j.rslot);
             for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
             ld.store((j.tag << 2) | 2u, std::memory_order_release);
         }
@@ -4690,7 +4774,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 // a LOOKAHEAD read nobody asked for yet: in the RAM tier once it landed
                 if ((F->rload[c][(size_t) s].load(std::memory_order_acquire) & 3u) == 2u) {
                     R.st[(size_t) s] = FastState::kRHold;
-                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
                 }
             } else if (R.st[(size_t) s] == FastState::kRRelease) {
                 const int key = R.key[(size_t) s];
@@ -4702,7 +4786,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) s] = FastState::kRFree;
             } else if (R.st[(size_t) s] == FastState::kRNew) {
                 R.st[(size_t) s] = FastState::kRHold;
-                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
+                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
             } else if (R.st[(size_t) s] == FastState::kRHold && tier_gc) {
                 // exclusive tiers, kept (STRATA_GLM_TIER_GC=0: not): a held copy the tables lost (a route promoted or re-read the expert while its
                 // demotion was still landing, which then held a second copy nothing points at) or of an expert VRAM
@@ -4713,7 +4797,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (key >= 0 && ro == s && F->slot_of[(size_t) key] < 0) continue;   // the normal case
                 if (key >= 0 && ro < 0 && F->slot_of[(size_t) key] < 0) {
                     F->ram_of[(size_t) key] = s;
-                    upd(F->rtab_key(key), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(key), (unsigned long long) (R.slot((size_t) s)));
                     ++F->diag_adopt;
                     continue;
                 }
@@ -4740,7 +4824,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         auto& R = F->rc[(size_t) d.rclass];
         if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
             R.st[(size_t) d.rslot] = FastState::kRHold;
-            upd(F->rtab_key(d.key), (unsigned long long) (R.base + (size_t) d.rslot * R.stride));
+            upd(F->rtab_key(d.key), (unsigned long long) (R.slot((size_t) d.rslot)));
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
                 upd(F->tab_key((size_t) d.key), 0ull);
                 F->slot_of[(size_t) d.key] = -1;
@@ -4756,6 +4840,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         if (F->bg_hold) break;   // lending retires moves without starting spare-refill demotions
         auto& P = F->lp[(size_t) il];
         if (P.n == 0) continue;
+        if (F->ml.lent && il == F->ml.il) continue;   // (STRATA_GLM_MTP_LEND: the draft layer stays as it was lent)
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         for (int j = 0; j < gf::kSpares; ++j) {
             if (P.spare[j] >= 0) continue;
@@ -4839,7 +4924,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.tick[(size_t) rs] = F->clock;
                 R.st[(size_t) rs] = FastState::kRDemote;
                 F->ram_of[(size_t) vkey] = rs;
-                cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(v),
+                cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(v),
                                 F->L[(size_t) il].blob, cudaMemcpyDeviceToHost, F->copy);
                 cudaEvent_t ev = F->get_event();
                 cudaEventRecord(ev, F->copy);
@@ -4924,7 +5009,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) m.rslot] = FastState::kRHold;
                 R.tick[(size_t) m.rslot] = F->clock;
                 F->ram_of[(size_t) m.key] = m.rslot;
-                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.base + (size_t) m.rslot * R.stride));
+                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.slot((size_t) m.rslot)));
                 ++F->bg_down;
             }
             F->ev_free.push_back(m.ev);
@@ -4971,6 +5056,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             std::vector<Cand> cands;
             for (int il = l0_; il < lt_; ++il) {
                 if (!F->L[(size_t) il].moe || F->layer_rc[(size_t) il] < 0) continue;
+                if (F->ml.lent && il == F->ml.il) continue;   // (STRATA_GLM_MTP_LEND: as above)
                 const auto& P = F->lp[(size_t) il];
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
                 int cs = -1;
@@ -5023,13 +5109,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (c.free_slot >= 0) {
                     P.st[(size_t) c.free_slot] = FastState::kLanding;
                     R.st[(size_t) c.rs] = FastState::kRPin;
-                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.base + (size_t) c.rs * R.stride, F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.slot((size_t) c.rs), F->L[(size_t) c.il].blob,
                                     cudaMemcpyHostToDevice, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
                     F->bg.push_back(FastState::BgMove{c.il, c.free_slot, c.il * NE + c.e, rc, c.rs, true, ev});
                     ++filled;
-                } else if (lane_all && c.cold_slot >= 0 && c.hot >= bg_ratio * std::max<uint32_t>(c.cold, 1u) + 4u) {
+                } else if (strata::core::tier_swaps_on(lane_all, strata::core::tier_policy()) && c.cold_slot >= 0 &&
+                           strata::core::tier_swap_due(c.hot, c.cold, bg_ratio)) {   // (STRATA_GLM_PROMOTE_SWAP: any plan)
                     int rs = -1;
                     for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                         if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
@@ -5038,7 +5125,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     P.st[(size_t) c.cold_slot] = FastState::kDraining;   // (still live in VRAM until the copy landed)
                     R.st[(size_t) rs] = FastState::kRDemote;
                     R.key[(size_t) rs] = vkey;
-                    cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
                                     cudaMemcpyDeviceToHost, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
@@ -5714,6 +5801,14 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: no draft block on this half";
         return false;
     }
+    if (F->ml.lent) {   // (STRATA_GLM_MTP_LEND: the schedulers draft only while it is owned - never expected here)
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "glm mtp lend: CUDA%d WARNING: a draft step while the draft layer's slots are lent "
+                                 "(its experts are missing: the drafts are poor, the tokens unchanged)\n", dev_);
+        }
+    }
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
     sub = sub && F->mtp_dv > 0;
@@ -6112,7 +6207,8 @@ bool Glm5Model::spec_ready() const {
         if (m->fast_ == nullptr) return false;
         last = m;
     }
-    return last->mtp_il_ >= 0;
+    // (STRATA_GLM_MTP_LEND: not while its slots are lent - nor, with _MORE, while any part's recurrent-state copies are)
+    return last->mtp_il_ >= 0 && !mtp_lent();
 }
 
 Glm5Model* Glm5Model::spec_head_last() {
@@ -7011,6 +7107,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->mtp_catch_drop(m->cur_seq_, 0);   // (... nor its)
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         err = "cannot read " + path;
@@ -7206,6 +7303,7 @@ uint64_t Glm5Model::slot_save(std::vector<uint8_t>& data, std::string& err) {
 bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->mtp_catch_drop(m->cur_seq_, 0);   // (... nor its)
     size_t pos = 0;
     const auto get = [&](void* p, size_t bytes) {
         if (pos + bytes > data.size()) return false;
