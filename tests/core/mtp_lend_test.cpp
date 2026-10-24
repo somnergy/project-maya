@@ -6,6 +6,7 @@
 #include "strata/core/tier_policy.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <utility>
@@ -22,6 +23,8 @@ void expect(bool ok, const char* what) {
 using strata::core::MtpLendAct;
 using strata::core::MtpLendClock;
 using strata::core::MtpLendPolicy;
+using strata::core::MtpLendExtra;
+using strata::core::MtpCatchRing;
 
 // a run of the scheduler: (time, running) samples every `dt` seconds; each act is done at once (the engine's switch);
 // returns the acts in order with their times
@@ -194,6 +197,119 @@ int main() {
         expect(c4[0] * 200 + c4[1] * 100 <= 350 && c4[0] + c4[1] >= 2, "mixed strides fit the region");
         const std::vector<int> c5 = mtp_lend_counts(50, {100}, {0}, 291, nullptr);
         expect(c5[0] == 0, "a region smaller than a slot lends nothing");
+    }
+    // STRATA_GLM_MTP_LEND_SKIP_READ / _CATCHUP: the parse
+    {
+        const MtpLendExtra d = mtp_lend_extra_parse(nullptr, nullptr);
+        expect(!d.skip_read && d.catchup == 2048, "extra defaults: no skip, 2048 positions");
+        const MtpLendExtra x = mtp_lend_extra_parse("1", "0");
+        expect(x.skip_read && x.catchup == 0, "skip without a catch-up");
+        expect(mtp_lend_extra_parse("1", "-5").catchup == 2048, "a negative catch-up keeps the default");
+        expect(mtp_lend_extra_parse("1", "4096").catchup == 4096, "catch-up 4096");
+    }
+    // the catch-up ring: a read's chunks in order, the newest cap kept, a rewind drops the suffix, runs for the fill
+    {
+        MtpCatchRing r;
+        r.init(8);
+        std::vector<int32_t> nx(20);
+        for (int i = 0; i < 20; ++i) nx[(size_t) i] = 1000 + i;
+        int seg[2][3];
+        // 5 rows at 100..104
+        int ns = r.append(100, 5, nx.data(), seg);
+        expect(ns == 1 && seg[0][0] == 0 && seg[0][1] == 5 && seg[0][2] == 0 && r.count == 5, "append 5 into 8");
+        // 6 more at 105..110: 3 fit before the end, 3 wrap; 3 old ones pushed out
+        ns = r.append(105, 6, nx.data(), seg);
+        expect(ns == 2 && seg[0][0] == 5 && seg[0][1] == 3 && seg[0][2] == 0 && seg[1][0] == 0 && seg[1][1] == 3 &&
+                   seg[1][2] == 3,
+               "a wrap: two runs");
+        expect(r.count == 8 && r.lost == 3, "the ring keeps the newest 8, 3 lost");
+        expect(r.pos[(size_t) r.at(0)] == 103 && r.pos[(size_t) r.at(7)] == 110, "oldest 103, newest 110");
+        expect(r.next[(size_t) r.at(0)] == 1003 && r.next[(size_t) r.at(7)] == 1005, "tokens by row");
+        // runs for a conversation at position 200: oldest first, split where the indices wrap, at most 4 rows each
+        std::vector<std::array<int64_t, 3>> got;
+        r.runs(200, 4, [&](int i, int64_t p, int n) { got.push_back({(int64_t) i, p, (int64_t) n}); });
+        bool ok = got.size() == 3 && got[0][1] == 103 && got[0][2] == 4 && got[1][1] == 107 && got[1][2] == 1 &&
+                  got[2][1] == 108 && got[2][2] == 3 && got[2][0] == 0;
+        int64_t sum = 0;
+        for (const auto& g : got) sum += g[2];
+        expect(ok && sum == 8, "runs: 103-106 (4 rows at most), 107 (the ring's end), 108-110");
+        // only entries whose next token is behind the conversation's position
+        got.clear();
+        r.runs(108, 16, [&](int i, int64_t p, int n) { got.push_back({(int64_t) i, p, (int64_t) n}); });
+        sum = 0;
+        for (const auto& g : got) sum += g[2];
+        expect(sum == 4 && got.back()[1] + got.back()[2] - 1 == 106, "entries up to 106 at position 108");
+        // a read at 107 rewrites 107.. : they go, 103..106 stay
+        r.drop_from(107);
+        expect(r.count == 4 && r.pos[(size_t) r.at(3)] == 106, "a rewind drops the newest");
+        ns = r.append(107, 2, nx.data(), seg);
+        expect(ns == 2 && r.count == 6 && r.pos[(size_t) r.at(5)] == 108 && r.next[(size_t) r.at(4)] == 1000,
+               "appended after the drop (across the ring's end)");
+        // a gap between reads (decode positions in between): two runs
+        ns = r.append(150, 2, nx.data() + 10, seg);
+        got.clear();
+        r.runs(1000, 16, [&](int i, int64_t p, int n) { got.push_back({(int64_t) i, p, (int64_t) n}); });
+        expect(r.count == 8 && got.size() >= 2 && got.back()[1] == 150 && got.back()[2] == 2, "a gap splits the runs");
+        // more rows than the ring: the newest cap of them
+        MtpCatchRing q;
+        q.init(4);
+        ns = q.append(0, 10, nx.data(), seg);
+        expect(ns == 1 && seg[0][2] == 6 && seg[0][1] == 4 && q.lost == 6 && q.pos[(size_t) q.at(0)] == 6 &&
+                   q.next[(size_t) q.at(0)] == 1006,
+               "10 rows into 4: rows 6..9");
+        r.drop_from(0);
+        expect(r.count == 0, "drop all");
+        MtpCatchRing z;
+        z.init(0);
+        expect(z.append(0, 3, nx.data(), seg) == 0 && z.count == 0, "cap 0 keeps nothing");
+    }
+    // STRATA_GLM_MTP_LEND_MORE: the parse, and the slots over several regions
+    {
+        expect(!mtp_lend_extra_parse(nullptr, nullptr, nullptr).more, "more: off by default");
+        expect(mtp_lend_extra_parse(nullptr, nullptr, "1").more, "more: 1");
+        // one region: the same counts as mtp_lend_counts
+        const size_t trunk = 11920000;
+        std::vector<size_t> st(21, trunk);
+        std::vector<int> have(21, 0);
+        for (int k = 0; k < 21; ++k) have[(size_t) k] = 204 + (k * 47) % 48;
+        const auto gain = [&](int k, int j) { return (1.0 + 0.05 * (21 - k)) / (1.0 + j); };
+        const size_t region = 222ull * 14930000ull;
+        const std::vector<int> cnt = mtp_lend_counts(region, st, have, 291, gain);
+        const auto pl = mtp_lend_place({region}, st, have, 291, gain);
+        bool same = pl.size() == cnt.size();
+        for (size_t k = 0; same && k < cnt.size(); ++k) same = (int) pl[k].size() == cnt[k];
+        expect(same, "one region: mtp_lend_counts' counts");
+        // Maya-L's last GPU with MORE: the draft region, the NextN block's weights, the windows' block
+        const std::vector<size_t> regs = {region, 173ull << 20, 603ull << 20};
+        const auto p3 = mtp_lend_place(regs, st, have, 291, gain);
+        std::vector<std::vector<std::pair<size_t, size_t>>> iv(regs.size());
+        int tot = 0;
+        bool inside = true;
+        for (size_t k = 0; k < p3.size(); ++k)
+            for (const auto& sl : p3[k]) {
+                ++tot;
+                inside = inside && sl.region >= 0 && sl.region < (int) regs.size() && sl.off + st[k] <= regs[(size_t) sl.region];
+                if (sl.region >= 0 && sl.region < (int) regs.size()) iv[(size_t) sl.region].push_back({sl.off, sl.off + st[k]});
+            }
+        bool tiled = true;
+        for (auto& v : iv) {
+            std::sort(v.begin(), v.end());
+            for (size_t i = 0; i < v.size(); ++i) tiled = tiled && v[i].first == (i == 0 ? 0 : v[i - 1].second);
+        }
+        int want = 0;
+        for (const size_t r : regs) want += (int) (r / trunk);
+        expect(inside && tiled, "several regions: every slot inside one, each region's front tiled, no overlap");
+        expect(tot == want, "several regions: as many slots as each region holds");
+        // a region smaller than every slot takes none; mixed strides go where they fit
+        const auto p4 = mtp_lend_place({50, 250, 100}, {100, 200}, {0, 0}, 291, nullptr);
+        int r0 = 0;
+        for (const auto& v : p4)
+            for (const auto& sl : v) r0 += sl.region == 0;
+        expect(r0 == 0, "a region smaller than every slot takes none");
+        size_t used1 = 0, used2 = 0;
+        for (size_t k = 0; k < p4.size(); ++k)
+            for (const auto& sl : p4[k]) (sl.region == 1 ? used1 : used2) += k == 0 ? 100 : 200;
+        expect(used1 <= 250 && used2 <= 100 && used1 + used2 >= 300, "mixed strides fill where they fit");
     }
     if (fails == 0) std::printf("mtp_lend_test: all passed\n");
     return fails == 0 ? 0 : 1;

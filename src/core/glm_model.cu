@@ -628,7 +628,7 @@ Glm5Model::~Glm5Model() {
             SeqCtx& c = seq_[s];
             if (s > 0) {
                 for (float* d : {c.state, c.kda_bak})
-                    if (d) cudaFree(d);
+                    if (d && !(d == c.kda_bak && mtpw_carved(d))) cudaFree(d);   // (MTP_LEND_MORE: the windows' block)
                 snap_free(c.snap);
                 snap_free(c.snap_pool);
                 kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
@@ -851,6 +851,7 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    mtp_catch_drop(cur_seq_, 0);   // (nor are the NextN catch-up's entries its)
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();

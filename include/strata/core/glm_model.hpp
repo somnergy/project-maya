@@ -283,6 +283,15 @@ public:
     bool mtp_lend_ready() const;
     bool mtp_lent() const;
     bool mtp_lend_switch(bool lend, const std::string& why, std::string& err);
+    /// STRATA_GLM_MTP_LEND_SKIP_READ: the NextN cache entries conversation `sq`'s reads left out while the slots were
+    /// lent (the newest STRATA_GLM_MTP_LEND_CATCHUP of them), filled now - before it drafts.  No-op without any.
+    bool mtp_catchup(int sq, std::string& err);
+    /// STRATA_GLM_MTP_LEND_BG: a reclaim is under way in the background (mtp_lent() stays true until it is done);
+    /// mtp_reclaim_due(): a part's copies landed - mtp_reclaim_poll moves it on: call it with every part idle (after
+    /// the scheduler's drain), outside a prompt's read
+    bool mtp_reclaiming() const;
+    bool mtp_reclaim_due() const;
+    bool mtp_reclaim_poll(std::string& err);
     int32_t forced(int32_t sampled) {
         int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
@@ -1043,8 +1052,22 @@ public:
     // shares, empty without them), the pinned copy's release, and this part's switch
     bool mtp_lend_setup(const std::vector<std::vector<double>>& share, std::string& err);
     void mtp_lend_free();
+    void mtp_catch_setup();
+    // STRATA_GLM_MTP_LEND_MORE: p is inside this part's windows' block (glm_mtp_rows.cu), and that block (null, 0: none)
+    bool mtpw_carved(const void* p) const;
+    std::pair<uint8_t*, size_t> mtpw_block() const;
     bool mtp_lend_part(bool lend, const std::string& why, std::string& err);
     bool mtp_lend_step_(bool lend, const std::string& why, std::string& err);   // (mtp_lend_part's body)
+    // STRATA_GLM_MTP_LEND_SKIP_READ (the part with the draft layer): whether this chunk's NextN cache fill is left out
+    // (the slots lent); keep the left-out rows' hidden states (rows [0, Tv) of the chunk at p0: R the chunk's residual
+    // streams, hbuf Tv x n_embd floats of scratch); drop conversation sq's entries at `from` or after; the catch-up
+    bool mtp_skip_fill() const;
+    void mtp_catch_keep(int64_t p0, int Tv, const int32_t* next_ids, const float* R, float* hbuf, cudaStream_t s);
+    void mtp_catch_drop(int sq, int64_t from);
+    bool mtp_catchup_part(int sq, std::string& err);
+    bool mtp_reclaim_begin(const std::string& why, std::string& err);
+    bool mtp_reclaim_step(std::string& err);
+    bool mtp_reclaim_advance(std::string& err);   // (mtp_reclaim_step; a failure stops the lending for good)
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)
     // this half's layers over a chunk (rows in pf_->R); next_ids / next_img: the NextN block's next tokens and, where
