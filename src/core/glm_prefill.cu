@@ -1537,6 +1537,17 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     const Glm5Geometry& g = g_;
     const size_t T = (size_t) Tn, E = (size_t) g.n_embd;
     S->sub = mixer_sub(T, g, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env);
+    // the indexer's key / gate ring holds a sub-batch with the open pool before it: a smaller ring (MAYA_GLM_IK_RING)
+    // caps the sub-batch (the default ring holds STRATA_GLM_PREFILL_SUB's largest)
+    if (S->has_dsa && ik_ring_ > 0 && S->sub > ik_ring_ - 64) {
+        const int cap = std::max(16, (ik_ring_ - 64) / 16 * 16);
+        static bool said = false;
+        if (!said)
+            std::fprintf(stderr, "glm prefill: CUDA%d mixer sub-batches of %d capped at %d by the indexer ring of %d "
+                         "positions (MAYA_GLM_IK_RING)\n", dev_, S->sub, cap, ik_ring_);
+        said = true;
+        S->sub = cap;
+    }
     // KV streaming: the stage holds the positions up to the prompt's end (whole pages), not the whole context - at 1M
     // positions the whole one is 1 GB a part, which every prompt would take from the expert pool
     size_t stage = (size_t) kv_stage_bytes_;
@@ -3269,6 +3280,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #endif
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
+        // STRATA_GLM_MMQ_TILE=<fixed columns>: each MMQ launch takes the column tile that does its experts' rows with the
+        // least work (mmq::tile_cols) instead of the one that covers its busiest expert in one tile.  A short prompt's
+        // chunk routes ~30 rows to most of a layer's experts and a hundred or more to a few, so the launch ran
+        // 112-128-column tiles where nearly all experts fill a quarter of one: four times the int8 products and
+        // activation loads of what they need.  The heavy experts then take several narrower tiles (their weights
+        // decoded once a tile).  Unset or 0: the tile for the busiest expert, as before
+        static const int mmq_tile_fixed = [] {
+            const char* v = getenv("STRATA_GLM_MMQ_TILE");
+            const int n = v ? std::atoi(v) : 0;
+            if (n > 0)
+                std::fprintf(stderr, "glm prefill: each expert product takes the column tile with the least work for "
+                                     "its experts' rows (MAYA_GLM_MMQ_TILE=%d)\n", n);
+            return std::max(0, n);
+        }();
         const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
             for (int i0 = 0; i0 < n_exp;) {
@@ -3338,6 +3363,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gu.ids = S->iota;
                     gu.total_rows = nrows;
                     gu.max_rows = max_rows;
+                    gu.opt_rows = mmq_tile_fixed > 0 ? mmq::tile_cols(hb + i0, i1 - i0, max_rows, mmq_tile_fixed) : 0;
                     gu.dst = GU - (size_t) a * (2 * nff);
                     gu.ld_dst = 2 * nff;
                     if (glu) {
@@ -3359,6 +3385,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.ids = S->iota;
                     dn.total_rows = nrows;
                     dn.max_rows = max_rows;
+                    dn.opt_rows = gu.opt_rows;
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
                     S->mq->run(dn, s);

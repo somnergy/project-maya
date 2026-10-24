@@ -623,6 +623,15 @@ public:
     // in pieces of the ring) - 8 KB/position/layer, 1 GB per card saved at 128K; a snapshot keeps the open pool's rows
     // (snap_pool_: per DSA layer kpool-1 ik rows, then kpool-1 ig rows), since later positions overwrite their slots
     int ik_ring_ = 0;
+    // the ring's positions for a context of ctx: 8192 + 64 (STRATA_GLM_PREFILL_SUB's largest sub-batch + the open
+    // pool), or STRATA_GLM_IK_RING's (a multiple of kpool, 128 at least) - the prompt path then caps its mixer
+    // sub-batch at the ring less 64, so a ring of the sub-batch it picks anyway + 64 changes nothing it computes
+    static int ik_ring_rows(int64_t ctx, int kpool);
+    // STRATA_GLM_SNAP_HOST=1: the snapshots (snap_, snap_pool_, every sequence's) in pinned host RAM instead of VRAM -
+    // a prompt's save and a turn's restore copy them over PCIe (~80 MB a half), the VRAM goes to the expert pool
+    static bool snap_host_setting();
+    static bool snap_malloc(float** p, size_t bytes);
+    static void snap_free(float* p);
     // the fast path's latent cache in INT8 records (--kv int8 / STRATA_GLM_KV_INT8=1; glm_fast.hpp lat8_rec_bytes):
     // 544 bytes a position and layer against FP16's 1024
     bool lat_q8_ = false;
