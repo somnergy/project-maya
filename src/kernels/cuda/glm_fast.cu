@@ -24,6 +24,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 #include "dsa_topk.cuh"
+#include "glm_lat8.cuh"
 
 #include <algorithm>
 #include <atomic>
@@ -2024,7 +2025,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
         }
 }
 
-#if defined(STRATA_USE_HIP)
+// (also on NVIDIA, opt-in: STRATA_GLM_MV_INFLIGHT=1 - mv_rdna_device)
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
 // Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
 // head), and on a Radeon 8065S row_dot<14> ran them at 165-220 GB/s of the 273 the LPDDR5X gives: its loop is not
@@ -2063,12 +2064,16 @@ __device__ __forceinline__ Q6X q6_xload(const block_q8_1* x, int lane) {   // x:
 }
 // sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract
 __device__ __forceinline__ int q6_idot(int q, int u) {
+#if defined(STRATA_USE_HIP)
 #if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
     defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
     return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
                                    false);
 #else
     return __dp4a(__vsubss4(q, 0x20202020), u, 0);
+#endif
+#else
+    return __dp4a((int) __vsubss4(q, 0x20202020), u, 0);   // (dot_q6_K's own form on NVIDIA)
 #endif
 }
 // dot_q6_K's float arithmetic, term for term (the same products, sums and order)
@@ -2146,6 +2151,9 @@ __device__ __forceinline__ void bf16_rows_rdna(const uint16_t* row, const float*
 // BF16 job's WPB waves of one row; the dispatcher puts the BF16 jobs first so their long-K rows start early.
 template<int R, int NT, int U, int WPB, bool XL>
 __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+#if !defined(STRATA_USE_HIP)
+    if (b.skip != nullptr && *b.skip) return;   // (set_skip, as every other GEMV kernel here)
+#endif
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -2200,7 +2208,7 @@ __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CON
         }
     }
 }
-#endif
+// (end of the in-flight GEMV kernels)
 
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2902,6 +2910,62 @@ __device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, co
     if (lane == 0) score[p] = acc;
 }
 
+// STRATA_GLM_DSA_SCORE_PPW=N (2..32): dsa_score_block with N pools a warp - the query staged in shared memory once for
+// 8 N pools instead of 8, each warp's key (key_dim 128: 4 values a lane) in registers instead of re-read for each of
+// the 32 heads, two pools' heads interleaved.  Every pool's sum is dsa_score_block's: the same products in the same
+// order, the same warp_sum, the same relu-weighted sum over the heads.
+__device__ __forceinline__ void dsa_score_block_ppw(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                    const float* __restrict__ iw, int idx_heads, int n_pools,
+                                                    float* __restrict__ score, int ppw) {
+    constexpr int KD = 128;
+    extern __shared__ float s_iq[];   // idx_heads * KD, then idx_heads weights
+    float* s_iw = s_iq + idx_heads * KD;
+    for (int i = threadIdx.x; i < idx_heads * KD; i += blockDim.x) s_iq[i] = iq[i];
+    for (int i = threadIdx.x; i < idx_heads; i += blockDim.x) s_iw[i] = iw[i];
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const int base = blockIdx.x * nw * ppw + warp;
+    for (int i = 0; i < ppw; i += 2) {
+        const int p0 = base + i * nw, p1 = p0 + nw;
+        if (p0 >= n_pools) return;
+        const bool two = i + 1 < ppw && p1 < n_pools;
+        float k0[KD / 32], k1[KD / 32];
+#pragma unroll
+        for (int j = 0; j < KD / 32; ++j) {
+            k0[j] = pooled[(size_t) KD * p0 + lane + 32 * j];
+            k1[j] = two ? pooled[(size_t) KD * p1 + lane + 32 * j] : 0.0f;
+        }
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (int h = 0; h < idx_heads; ++h) {
+            float d0 = 0.0f, d1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < KD / 32; ++j) {
+                const float q = s_iq[h * KD + lane + 32 * j];
+                d0 += q * k0[j];
+                d1 += q * k1[j];
+            }
+            d0 = warp_sum(d0);
+            d1 = warp_sum(d1);
+            acc0 += fmaxf(d0, 0.0f) * s_iw[h];
+            acc1 += fmaxf(d1, 0.0f) * s_iw[h];
+        }
+        if (lane == 0) {
+            score[p0] = acc0;
+            if (two) score[p1] = acc1;
+        }
+    }
+}
+__global__ void __launch_bounds__(256) dsa_score_ppw_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                            const float* __restrict__ iw, int idx_heads, int n_pools,
+                                                            float* __restrict__ score, int ppw) {
+    dsa_score_block_ppw(iq, pooled, iw, idx_heads, n_pools, score, ppw);
+}
+__global__ void __launch_bounds__(256) dsa_score_rows_ppw_kernel(DsaScoreRows a, int idx_heads, int ppw) {
+    const int r = blockIdx.y;
+    if ((int) blockIdx.x * (int) (blockDim.x >> 5) * ppw >= a.n_pools[r]) return;
+    dsa_score_block_ppw(a.iq[r], a.pooled[r], a.iw[r], idx_heads, a.n_pools[r], a.score[r], ppw);
+}
+
 __device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
                                                  int n_sel, int pos, int* __restrict__ cells);
 __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restrict__ score, int n_vis, int kpool,
@@ -3237,7 +3301,8 @@ struct MlaToks {
 __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restrict__ q_abs, int64_t q_stride,
                                                             const uint16_t* __restrict__ lat,
                                                             const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
-                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8) {
+                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8,
+                                                            bool q8vec) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
     extern __shared__ uint4 smem4[];
     uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
@@ -3282,6 +3347,33 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
             for (int j = 0; j < MLA_CHUNK * MLA_KV / 8 / 128; ++j) {
                 const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
                 *(uint4*) (sL + s * MLA_ROW + 8 * c8) = v[j];
+            }
+        } else if (q8vec) {
+            // the INT8 records 8 values a load, every load of the chunk issued before the first conversion (as the
+            // FP16 rows above): glm_lat8.cuh's exact code -> FP16 and one FP16 multiply give lat_h(lat8_f)'s bits
+            constexpr int NJ = MLA_CHUNK * MLA_KV / 8 / 128;
+            constexpr int REC = lat8_rec_bytes(MLA_KV);
+            uint2 w[NJ];
+            __half d[NJ];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                const int cell = s_cell[s];
+                if (cell >= 0) {
+                    const uint8_t* rec = (const uint8_t*) lat + (size_t) REC * cell;
+                    w[j] = ((const uint2*) rec)[c8];
+                    d[j] = ((const __half*) (rec + MLA_KV))[c8 >> 2];
+                } else {
+                    w[j] = make_uint2(0u, 0u);   // codes 0 times a zero scale: +0, the scalar path's padding
+                    d[j] = __ushort_as_half((unsigned short) 0);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                const __half2 d2 = __half2half2(d[j]);
+                const uint2 lo = glmb::lat8_q4(w[j].x, d2), hi = glmb::lat8_q4(w[j].y, d2);
+                *(uint4*) (sL + s * MLA_ROW + 8 * c8) = make_uint4(lo.x, lo.y, hi.x, hi.y);
             }
         } else {
             for (int i = tid; i < MLA_CHUNK * MLA_KV; i += 128) {
@@ -4872,7 +4964,7 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
-#if defined(STRATA_USE_HIP)
+// (the in-flight GEMV dispatch: RDNA3 by default, NVIDIA with STRATA_GLM_MV_INFLIGHT=1)
 namespace {
 // The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
 // or not.  The bench sets it (hip_expert_bench::mv_config); r == 0 is the original kernels, r < 0 the default: one row
@@ -4889,6 +4981,16 @@ constexpr int kMaxRdnaNt = 8;
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
 bool mv_rdna_device() {
+#if !defined(STRATA_USE_HIP)
+    // NVIDIA (STRATA_GLM_MV_INFLIGHT=1): row_dot<14> keeps one 210-byte block a lane in flight, so the dense GEMVs
+    // read at 64-78% of an RTX PRO 5000's 1.34 TB/s (a one-row decode step: 81 launches, 31% of its time); the same
+    // kernels with U blocks in flight, every row's sum row_dot's bit for bit
+    static const bool on_nv = [] {
+        const char* v = std::getenv("STRATA_GLM_MV_INFLIGHT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on_nv && g_mv_r.load(std::memory_order_relaxed) != 0;
+#else
     static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
@@ -4905,6 +5007,7 @@ bool mv_rdna_device() {
         cached_device = device;
     }
     return on;
+#endif
 }
 template<int NT, int R, int U>
 void mv_rdna_launch_w(const MvBatch& b, int blocks, int wpb, int lds, cudaStream_t s) {
@@ -4944,7 +5047,17 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
-    const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+    int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+#if !defined(STRATA_USE_HIP)
+    // NVIDIA's default by the activations, the fastest of glm_mv_inflight_bench --sweep over a decode step's batches
+    // (RTX PRO 5000, a step's mix of Maya-L's batches against the original kernels): one row r1 u1 w4 (-15%), two
+    // r1 u2 w8 (-14%), three or more r2 u1 w4 (four: -28%); the activations from global memory
+    if (r < 0) {
+        if (nt == 1) r = 1, u = 1, wpb = 4;
+        else if (nt == 2) r = 1, u = 2, wpb = 8;
+        else r = 2, u = 1, wpb = 4;
+    }
+#endif
     if (r < 0) { r = 1; u = 2; }
     if (nt > 1 && r > 2) r = 2;
     MvBatch b{};
@@ -4960,8 +5073,15 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
             }
     if (m == 0) return true;
     b.n = m;
+#if !defined(STRATA_USE_HIP)
+    b.skip = g_skip;
+#endif
     const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
+#if defined(STRATA_USE_HIP)
     const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
+#else
+    const bool use_lds = lds_mode > 0;   // (NVIDIA: staging the activations measured slower or even)
+#endif
     int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
     if (lds > 48 * 1024) lds = 0;
     switch (nt) {
@@ -4985,7 +5105,7 @@ void mv_config(int r, int u, int wpb, int lds) {
     g_mv_lds.store(lds);
 }
 }  // namespace hip_expert_bench
-#endif
+// (end of the in-flight GEMV dispatch)
 
 // A batch's EXL3 jobs (w: an exl3::Mat) through exl3::mv, marked done, in launches of up to exl3::kMaxMvJobs - nt > 0:
 // nt activations one after another (mv_nt's layout), else each job's ncol at its strides; a job's activations (a
@@ -5064,7 +5184,6 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         for (int i = 0; i < n; ++i) all = all && done[i];
         if (all) return true;
     }
-#if defined(STRATA_USE_HIP)
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
@@ -5095,7 +5214,6 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 if (sub_done[k]) done[idx[k]] = true;
         }
     }
-#endif
     // several columns: the tiled kernels (STRATA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
         const char* v = getenv("STRATA_GLM_MV_TILED");
@@ -5343,9 +5461,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
                 if (!mv(one, k, s)) return false;
                 continue;
             }
-#if defined(STRATA_USE_HIP)
             if (typed) mv_rdna(part, n, w, pd, s);
-#endif
             switch (w) {
                 case 2: mv_nt_launch<2>(part, n, typed, pd, s); break;
                 case 3: mv_nt_launch<3>(part, n, typed, pd, s); break;
@@ -5359,9 +5475,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         launch_check("mv_nt");
         return true;
     }
-#if defined(STRATA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
-#endif
     switch (nt) {
         case 2: mv_nt_launch<2>(jobs, n, typed, done, s); break;
         case 3: mv_nt_launch<3>(jobs, n, typed, done, s); break;
@@ -5536,10 +5650,30 @@ void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
     launch_check("dsa_prep");
 }
 
+// the pools a warp of the indexer's scores (STRATA_GLM_DSA_SCORE_PPW, 1 = the original kernel; dsa_score_config:
+// a bench's override, < 0 back to the setting)
+static std::atomic<int> g_dsa_ppw_override{-1};
+void dsa_score_config(int ppw) { g_dsa_ppw_override.store(ppw); }
+static int dsa_score_ppw(int key_dim) {
+    static const int env = [] {
+        const char* v = getenv("STRATA_GLM_DSA_SCORE_PPW");
+        return v == nullptr ? 1 : std::max(1, std::min(32, std::atoi(v)));
+    }();
+    const int o = g_dsa_ppw_override.load(std::memory_order_relaxed);
+    const int ppw = o >= 1 ? std::min(32, o) : env;
+    return key_dim == 128 ? ppw : 1;
+}
+
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s) {
     if (n_pools <= 0) return;
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    if (const int ppw = dsa_score_ppw(key_dim); ppw > 1) {
+        dsa_score_ppw_kernel<<<(n_pools + 8 * ppw - 1) / (8 * ppw), 256, smem, s>>>(iq, pooled, iw, idx_heads, n_pools,
+                                                                                    score, ppw);
+        launch_check("dsa_score");
+        return;
+    }
     dsa_score_kernel<<<(n_pools + 7) / 8, 256, smem, s>>>(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
     launch_check("dsa_score");
 }
@@ -5549,6 +5683,12 @@ void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cu
     for (int r = 0; r < n; ++r) most = std::max(most, a.n_pools[r]);
     if (n < 1 || most < 1) return;
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    if (const int ppw = dsa_score_ppw(key_dim); ppw > 1) {
+        dsa_score_rows_ppw_kernel<<<dim3((unsigned) ((most + 8 * ppw - 1) / (8 * ppw)), (unsigned) n), 256, smem, s>>>(
+            a, idx_heads, ppw);
+        launch_check("dsa_score_rows");
+        return;
+    }
     dsa_score_rows_kernel<<<dim3((unsigned) ((most + 7) / 8), (unsigned) n), 256, smem, s>>>(a, key_dim, idx_heads);
     launch_check("dsa_score_rows");
 }
@@ -5631,6 +5771,18 @@ static float* mla_part(int dev, int n_head, int kv_lora, int chunks, int* cap) {
     return part[dev];
 }
 
+// STRATA_GLM_ATTN_LAT8_VEC=1: the tensor-core attention reads INT8 latent records 8 values a load, all of a chunk's
+// loads in flight at once, instead of a byte and a scale a load (128 dependent rounds a thread a chunk: ~260 us a
+// one-row call at 2,048 cells on an RTX PRO 5000, as long as a launch of 4 rows).  The FP16 the chunk holds is the
+// same bit for bit (glm_lat8.cuh), so every sum is.
+static bool mla_lat8_vec() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_ATTN_LAT8_VEC");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 // whether this device takes the tensor-core attention (NVIDIA sm_80+); STRATA_GLM_MLA_MMA=0: the F32 chunks (A/B)
 static bool mla_mma_on(int dev) {
     static int on_[16] = {};
@@ -5670,7 +5822,8 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
         MlaToks tk{};
         for (int i = 0; i < nt; ++i) tk.n_sel[i] = n_sel[t0 + i];
         mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
-            q_abs + t0 * q_stride, q_stride, lat, cells + t0 * c_stride, c_stride, tk, n_head, qk_nope, part, lat_q8);
+            q_abs + t0 * q_stride, q_stride, lat, cells + t0 * c_stride, c_stride, tk, n_head, qk_nope, part, lat_q8,
+            lat_q8 && mla_lat8_vec());
         mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }
@@ -5700,7 +5853,8 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
             tk.cells[i] = cells[t0 + i];
         }
         mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
-            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8);
+            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8,
+            lat_q8 && mla_lat8_vec());
         mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }

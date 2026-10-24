@@ -49,7 +49,17 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    /// the rows the launch sizes its column tile for (0: max_rows - one tile covers the busiest expert, so every
+    /// expert computes that many columns however few rows it has; see tile_cols)
+    int64_t opt_rows = 0;
 };
+
+/// The column tile for one launch over the experts with host bounds hb[0..n] (hb[e + 1] - hb[e] rows each): of the
+/// tiles MMQ has (8, 16, ..., 128 columns), the one with the least work by sum over the experts with rows of
+/// ceil(rows / J) * (fixed_cols + J) - a tile costs its J columns (the int8 products and the activation rows it loads)
+/// and a fixed part that does not depend on J (decoding its block of the expert's weights to int8), here in columns'
+/// worth.  fixed_cols <= 0: the tile for max_rows (what the launch takes without opt_rows).  Pass it as opt_rows.
+int tile_cols(const int32_t* hb, int n, int max_rows, int fixed_cols);
 
 /// This build and the current device have the fused gate/up + SwiGLU product (Context::run_glu) for `ggml_type` with
 /// `n_ff` output rows: CUDA on an NVIDIA GPU with int8 tensor cores (Turing or later), n_ff a multiple of 128.

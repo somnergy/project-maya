@@ -311,6 +311,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_rows_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_rows_attn_test COMMAND glm_rows_attn_test)
     set_tests_properties(glm_rows_attn_test PROPERTIES TIMEOUT 300)
+    # the decode attention over INT8 latent records against FP16 rows of the same values (STRATA_GLM_ATTN_LAT8_VEC
+    # on and off), bitwise, with each path's time
+    add_executable(glm_lat8_attn_test tests/glm_lat8_attn_test.cu)
+    target_link_libraries(glm_lat8_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_lat8_attn_test COMMAND glm_lat8_attn_test)
+    set_tests_properties(glm_lat8_attn_test PROPERTIES TIMEOUT 120)
+    # the dense GEMV with super-blocks in flight (STRATA_GLM_MV_INFLIGHT) against the original kernels at Maya's
+    # shapes, one row and a batched step's rows: parity bit for bit, and the times (--sweep: every shape)
+    add_executable(glm_mv_inflight_bench tests/glm_mv_inflight_bench.cu)
+    target_include_directories(glm_mv_inflight_bench PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(glm_mv_inflight_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_mv_inflight_parity COMMAND glm_mv_inflight_bench --parity-only)
+    # the DSA indexer's pool scores with several pools a warp (STRATA_GLM_DSA_SCORE_PPW) against one a warp, bitwise,
+    # and the times
+    add_executable(glm_dsa_score_bench tests/glm_dsa_score_bench.cu)
+    target_link_libraries(glm_dsa_score_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_dsa_score_parity COMMAND glm_dsa_score_bench --parity-only)
   endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)

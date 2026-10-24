@@ -44,6 +44,17 @@ inline bool skip_empty_on() {
     return on;
 }
 
+// STRATA_GLM_SPARES=<0..kspares>: the empty slots a layer keeps for its routes' PCIe fetches (default kspares, 3).  A
+// fetch lands in a spare and stays (a promotion), else in scratch; a plan whose CPU lane takes every RAM-tier expert
+// fetches nothing, and its spares would stay empty - with fewer, the warm-up and the refills fill those slots instead
+inline int spares_setting(int kspares) {
+    static const int n = [kspares] {
+        const char* v = std::getenv("STRATA_GLM_SPARES");
+        return v != nullptr ? std::max(0, std::min(kspares, std::atoi(v))) : kspares;
+    }();
+    return n;
+}
+
 // All inputs are bytes. On an APU the GPU pool and pinned host allocations spend
 // the same physical memory; the runtime's GTT/carve-out size is not free RAM.
 inline size_t expert_pool_budget(bool unified, size_t device_free, size_t ram_available,

@@ -19,6 +19,45 @@
 
 namespace strata::core {
 
+int Glm5Model::ik_ring_rows(int64_t ctx, int kpool) {
+    static const int set = [] {
+        const char* v = getenv("STRATA_GLM_IK_RING");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+    }();
+    constexpr int64_t kDefault = 8192 + 64;
+    int64_t r = kDefault;
+    if (set > 0) {
+        const int64_t k = std::max(1, kpool);
+        r = std::min<int64_t>(kDefault, (std::max<int64_t>(set, 128) + k - 1) / k * k);
+    }
+    return (int) std::min<int64_t>(ctx, r);
+}
+
+bool Glm5Model::snap_host_setting() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_SNAP_HOST");
+        return v != nullptr && std::atoi(v) > 0;
+    }();
+    return on;
+}
+
+bool Glm5Model::snap_malloc(float** p, size_t bytes) {
+    const cudaError_t e = snap_host_setting() ? cudaHostAlloc((void**) p, bytes, cudaHostAllocPortable)
+                                              : cudaMalloc((void**) p, bytes);
+    if (e == cudaSuccess) return true;
+    cudaGetLastError();
+    *p = nullptr;
+    return false;
+}
+
+void Glm5Model::snap_free(float* p) {
+    if (p == nullptr) return;
+    if (snap_host_setting())
+        cudaFreeHost(p);
+    else
+        cudaFree(p);
+}
+
 void Glm5Model::seq_bind(int s) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     if (seq_.empty() || s == cur_seq_ || s < 0 || s >= (int) seq_.size()) return;
@@ -86,7 +125,7 @@ uint64_t Glm5Model::seq_layout(int64_t ctx, SeqCtx& c) const {
                                        : (int64_t) g.kv_lora * lat_rows / 2;
     for (auto* v : {&c.kda_S, &c.kda_conv, &c.dsa_lat, &c.dsa_ik, &c.dsa_ig, &c.dsa_pool})
         v->assign((size_t) g.n_layers + 1, 0);
-    c.ik_ring = (int) std::min<int64_t>(ctx, 8192 + 64);
+    c.ik_ring = ik_ring_rows(ctx, g.idx_kpool);
     const auto dsa = [&](int il) {
         c.dsa_lat[(size_t) il] = floats;
         floats += lat_floats;
@@ -161,22 +200,30 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     int n_rec = 0;
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il) ? 1 : 0;
     const size_t pool_floats = dsa_layers().size() * 2 * (size_t) ((g.idx_kpool - 1) * g.idx_key);
+    uint64_t snap_b = 0;
     for (int s = 0; s < n; ++s) {
         float*& snap = s == 0 ? snap_ : seq_[(size_t) s].snap;
         float*& snap_pool = s == 0 ? snap_pool_ : seq_[(size_t) s].snap_pool;
-        if ((snap == nullptr && n_rec > 0 && cudaMalloc(&snap, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) ||
-            (snap_pool == nullptr && pool_floats > 0 &&
-             cudaMalloc(&snap_pool, pool_floats * sizeof(float)) != cudaSuccess)) {
+        if ((snap == nullptr && n_rec > 0 && !snap_malloc(&snap, (size_t) n_rec * run * sizeof(float))) ||
+            (snap_pool == nullptr && pool_floats > 0 && !snap_malloc(&snap_pool, pool_floats * sizeof(float)))) {
             cudaGetLastError();
             err = "pack: the snapshot of sequence " + std::to_string(s) + " of " + std::to_string(n) +
                   " does not fit on CUDA" + std::to_string(dev_) + " - fewer conversations at once (--parallel)";
             return false;
         }
-        more += (uint64_t) ((n_rec > 0 ? (size_t) n_rec * run : 0) + pool_floats) * sizeof(float);
+        snap_b += (uint64_t) ((n_rec > 0 ? (size_t) n_rec * run : 0) + pool_floats) * sizeof(float);
     }
+    if (!snap_host_setting()) more += snap_b;
     std::fprintf(stderr, "glm multi: CUDA%d %d sequence states: the first for %lld tokens (%.2f GB), %d more for %lld "
-                 "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
-                 (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
+                 "(%.2f GB in all, %s)\n", dev_, n, (long long) max_ctx_,
+                 (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9,
+                 snap_host_setting() ? "the snapshots in pinned RAM" : "with every sequence's snapshot");
+    if (snap_host_setting())
+        std::fprintf(stderr, "glm multi: CUDA%d the snapshots in pinned RAM (MAYA_GLM_SNAP_HOST): %.2f GB\n", dev_,
+                     (double) snap_b / 1e9);
+    if (ik_ring_ != 8192 + 64 && ik_ring_ < max_ctx_)
+        std::fprintf(stderr, "glm multi: CUDA%d the indexer key ring holds %d positions (MAYA_GLM_IK_RING; 8256 by "
+                     "default)\n", dev_, ik_ring_);
     // several conversations drafting at once (STRATA_GLM_MULTI_MTP): their windows' buffers, before the pool too
     if (multi_mtp_setting() > 0 && !mtpw_alloc(err)) return false;
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
