@@ -40,6 +40,7 @@ struct Options {
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
     int tp = 2;
+    int parallel = 1;                 // several conversations at once (layer split only)
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
@@ -168,6 +169,30 @@ public:
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
+
+    /// Several conversations at once on a layer split (--parallel N).  Each sequence has its own state; the
+    /// prompt window path feeds a sequence, and decode tokens are pipelined stage 0 / stage 1 across the two
+    /// device groups.  No tensor parallel, no DSpark in this prototype.
+    struct Sampling {
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 64;
+        uint64_t seed = 0, counter = 0;
+        int pen_n = 0;
+        float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+    };
+    int parallel() const;
+    bool init_multi(int n, int64_t seq_ctx, std::string& err);
+    int seq_count() const;
+    bool feed_prompt_seq(int s, const int* ids, int n, std::function<void(int64_t)> progress, std::string& err);
+    int feed_prompt_first(int s, const int* ids, int n, std::function<void(int64_t)> progress, const Sampling& smp,
+                          std::string& err);
+    bool decode_token0(int s, int64_t p0, std::string& err);
+    int decode_token1(int s, int64_t p0, const Sampling& smp, std::string& err);
+    int sample_seq(int s, const Sampling& smp);
+    int64_t seq_pos(int s) const;
+    const std::vector<int32_t>& seq_tokens(int s) const;
+    void seq_reset(int s);
+    void copy_seq(int dst, int src);
 
     /// The vision tower: the token every position of an image's span carries (-1: no tower).
     int image_token() const;

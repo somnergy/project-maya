@@ -1154,6 +1154,26 @@ struct Model::Impl {
     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
     // same order whatever this process answered before)
     std::vector<uint32_t> prof_load;
+
+    // Many conversations at once (--parallel N, layer split, no TP, no DSpark): every sequence owns every per-state
+    // buffer; weights, scratch and the expert cache stay shared.  The two device groups are stage 0 / stage 1.
+    struct SeqState {
+        int64_t pos = 0, max_ctx = 0;
+        std::vector<int32_t> toks, ctoks;
+        std::vector<uint8_t*> win, snap_win, ring_bak;
+        std::vector<float*> c_kv, c_score, snap_kv, snap_sc, c_snap, c_rows;
+        std::vector<std::vector<uint8_t*>> src_ckv, src_ik;               // [source][device]
+        std::vector<std::vector<uint8_t>> hand;                           // [device] window hand-off buffer (host)
+        std::vector<std::vector<unsigned>> flag;                          // [device][32]
+        int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};
+        WinPlan last_wp;
+        int64_t last_p0 = -1;
+    };
+    std::vector<SeqState> seqs;
+    int seq_n = 0;
+    unsigned seq_item = 0;            // a hand-off value, unique over items
+    std::mutex dev_mu[2];             // one stage per device at a time (prompt feeds pause decode briefly)
+    std::vector<double> seq_ctx;
     Stats st;
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
                                                         // (plan_window's: the windows' plans are made in order)
@@ -12577,7 +12597,10 @@ struct Model::Impl {
         return x;
     }
 
-    bool run_dev(int di, int64_t p0, int T, const WinPlan& wp, std::string& err) {
+    uint8_t* hand_host(int dev, SeqState* q) const { return q ? q->hand[(size_t) dev].data() : devs[(size_t) dev].hand; }
+    unsigned* hand_flag_p(int dev, SeqState* q) const { return q ? q->flag[(size_t) dev].data() : devs[(size_t) dev].hand_flag; }
+
+    bool run_dev(int di, int64_t p0, int T, const WinPlan& wp, std::string& err, SeqState* q = nullptr) {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
@@ -12597,8 +12620,8 @@ struct Model::Impl {
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
                 } else {
-                    const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
-                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
+                    const int prev = (int) L[(size_t) il - 1].dev;
+                    xfer_get(hand_xfer(hand_host(prev, q), d, T, false), hand_flag_p(prev, q), wp.win, s);
                 }
             }
             // the compressed KV / index keys another group's source layer wrote this window
@@ -12627,7 +12650,8 @@ struct Model::Impl {
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            if (last && mi == 0 && il + 1 < g.nl)
+                xfer_put(hand_xfer(hand_host(di, q), d, T, true), hand_flag_p(di, q), wp.win, d.xcnt, s);
         }
         if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
         if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
@@ -13212,6 +13236,361 @@ struct Model::Impl {
         return cudaMemcpy(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
     }
 
+    // ---- several conversations at once: per-sequence state, prompt windows, pipelined decode ----------------
+    size_t window_hand_bytes() const {
+        return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
+    }
+
+    bool init_multi(int n, int64_t ctx, std::string& err) {
+        if (n <= 1) return true;
+        if (o.tp != 1) { err = "parallel needs --tp 1 (layer split)"; return false; }
+        if (o.dspark) { err = "parallel prototype needs --dspark off"; return false; }
+        seq_n = n;
+        seqs.assign((size_t) n, SeqState{});
+        const size_t winb = (size_t) g.win * win_rb();
+        auto alloc_u8 = [&](uint8_t*& p, size_t bytes, int dev) -> bool {
+            if (bytes == 0) { p = nullptr; return true; }
+            cudaSetDevice(devs[(size_t) dev].id);
+            if (cudaMalloc((void**) &p, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "sequence state does not fit on CUDA" + std::to_string(devs[(size_t) dev].id);
+                return false;
+            }
+            cudaMemset(p, 0, bytes);
+            return true;
+        };
+        auto alloc_f = [&](float*& p, size_t bytes, int dev) -> bool {
+            if (bytes == 0) { p = nullptr; return true; }
+            cudaSetDevice(devs[(size_t) dev].id);
+            if (cudaMalloc((void**) &p, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "sequence state does not fit on CUDA" + std::to_string(devs[(size_t) dev].id);
+                return false;
+            }
+            cudaMemset(p, 0, bytes);
+            return true;
+        };
+        for (int s = 0; s < n; ++s) {
+            SeqState& q = seqs[(size_t) s];
+            q.max_ctx = ctx;
+            q.win.assign(g.nl, nullptr); q.snap_win.assign(g.nl, nullptr); q.ring_bak.assign(g.nl, nullptr);
+            q.c_kv.assign(g.nl, nullptr); q.c_score.assign(g.nl, nullptr); q.snap_kv.assign(g.nl, nullptr);
+            q.snap_sc.assign(g.nl, nullptr); q.c_snap.assign(g.nl, nullptr); q.c_rows.assign(g.nl, nullptr);
+            for (int il = 0; il < g.nl; ++il) {
+                Layer& l = L[(size_t) il];
+                if (l.win != nullptr && !alloc_u8(q.win[(size_t) il], winb, l.dev)) return false;
+                if (l.snap_win != nullptr && !alloc_u8(q.snap_win[(size_t) il], winb, l.dev)) return false;
+                if (l.ring_bak != nullptr && !alloc_u8(q.ring_bak[(size_t) il], winb, l.dev)) return false;
+                const size_t nf = (size_t) l.ratio * g.hd;
+                if (l.c_kv != nullptr && !alloc_f(q.c_kv[(size_t) il], nf * 4, l.dev)) return false;
+                if (l.c_score != nullptr && !alloc_f(q.c_score[(size_t) il], nf * 4, l.dev)) return false;
+                if (l.snap_kv != nullptr && !alloc_f(q.snap_kv[(size_t) il], nf * 4, l.dev)) return false;
+                if (l.snap_sc != nullptr && !alloc_f(q.snap_sc[(size_t) il], nf * 4, l.dev)) return false;
+                if (l.c_snap != nullptr && !alloc_f(q.c_snap[(size_t) il], nf * 4, l.dev)) return false;
+                if (l.c_rows != nullptr && !alloc_f(q.c_rows[(size_t) il], (size_t) kWin * g.hd * 4, l.dev)) return false;
+            }
+            q.src_ckv.assign(srcs.size(), {});
+            q.src_ik.assign(srcs.size(), {});
+            for (size_t si = 0; si < srcs.size(); ++si) {
+                const Src& sr = srcs[si];
+                const int64_t rows = (ctx + sr.ratio - 1) / sr.ratio + 1;
+                q.src_ckv[si].assign(devs.size(), nullptr);
+                q.src_ik[si].assign(devs.size(), nullptr);
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    if (sr.ckv[di] != nullptr && !alloc_u8(q.src_ckv[si][di], (size_t) rows * ckv_rb(), (int) di)) return false;
+                    if (sr.ik[di] != nullptr && !alloc_u8(q.src_ik[si][di], (size_t) rows * ik_rb(), (int) di)) return false;
+                }
+            }
+            q.hand.resize(devs.size());
+            q.flag.resize(devs.size());
+            for (size_t di = 0; di < devs.size(); ++di) {
+                q.hand[di].assign(window_hand_bytes(), 0);
+                q.flag[di].assign(32, 0);
+            }
+        }
+        if (o.verbose)
+            std::fprintf(stderr, "ds4 multi: %d sequence states for %lld tokens each\n", n, (long long) ctx);
+        return true;
+    }
+
+    void bind_dev(SeqState& q, int di) {
+        for (int il = 0; il < g.nl; ++il) {
+            Layer& l = L[(size_t) il];
+            if (l.dev != di) continue;
+            l.win = q.win[(size_t) il];
+            l.snap_win = q.snap_win[(size_t) il];
+            l.ring_bak = q.ring_bak[(size_t) il];
+            l.c_kv = q.c_kv[(size_t) il];
+            l.c_score = q.c_score[(size_t) il];
+            l.snap_kv = q.snap_kv[(size_t) il];
+            l.snap_sc = q.snap_sc[(size_t) il];
+            l.c_snap = q.c_snap[(size_t) il];
+            l.c_rows = q.c_rows[(size_t) il];
+        }
+        for (size_t si = 0; si < srcs.size(); ++si) {
+            Src& sr = srcs[si];
+            if (di < (int) devs.size()) {
+                sr.ckv[(size_t) di] = q.src_ckv[si][(size_t) di];
+                sr.ik[(size_t) di] = q.src_ik[si][(size_t) di];
+            }
+        }
+    }
+
+    void bind_all(SeqState& q) {
+        for (int il = 0; il < g.nl; ++il) {
+            Layer& l = L[(size_t) il];
+            l.win = q.win[(size_t) il];
+            l.snap_win = q.snap_win[(size_t) il];
+            l.ring_bak = q.ring_bak[(size_t) il];
+            l.c_kv = q.c_kv[(size_t) il];
+            l.c_score = q.c_score[(size_t) il];
+            l.snap_kv = q.snap_kv[(size_t) il];
+            l.snap_sc = q.snap_sc[(size_t) il];
+            l.c_snap = q.c_snap[(size_t) il];
+            l.c_rows = q.c_rows[(size_t) il];
+        }
+        for (size_t si = 0; si < srcs.size(); ++si) {
+            Src& sr = srcs[si];
+            for (size_t di = 0; di < devs.size(); ++di) {
+                sr.ckv[di] = q.src_ckv[si][di];
+                sr.ik[di] = q.src_ik[si][di];
+            }
+        }
+    }
+
+    void copy_seq_state(int dst, int src) {
+        SeqState& a = seqs[(size_t) dst];
+        const SeqState& b = seqs[(size_t) src];
+        a.pos = b.pos;
+        a.max_ctx = b.max_ctx;
+        a.toks = b.toks;
+        a.ctoks = b.ctoks;
+        for (int t = 0; t < kWin; ++t) {
+            a.cur_topk_n[t] = b.cur_topk_n[t];
+            a.cur_cand_n[t] = b.cur_cand_n[t];
+        }
+        const size_t winb = (size_t) g.win * win_rb();
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            const size_t nf = (size_t) l.ratio * g.hd;
+            cudaSetDevice(devs[(size_t) l.dev].id);
+            if (b.win[(size_t) il] != nullptr)
+                cudaMemcpy(a.win[(size_t) il], b.win[(size_t) il], winb, cudaMemcpyDeviceToDevice);
+            if (b.snap_win[(size_t) il] != nullptr)
+                cudaMemcpy(a.snap_win[(size_t) il], b.snap_win[(size_t) il], winb, cudaMemcpyDeviceToDevice);
+            if (b.ring_bak[(size_t) il] != nullptr)
+                cudaMemcpy(a.ring_bak[(size_t) il], b.ring_bak[(size_t) il], winb, cudaMemcpyDeviceToDevice);
+            const size_t fb = nf * 4;
+            for (int j = 0; j < 6; ++j) {
+                float* aa[6] = {a.c_kv[(size_t) il], a.c_score[(size_t) il], a.snap_kv[(size_t) il],
+                                a.snap_sc[(size_t) il], a.c_snap[(size_t) il], a.c_rows[(size_t) il]};
+                const float* bb[6] = {b.c_kv[(size_t) il], b.c_score[(size_t) il], b.snap_kv[(size_t) il],
+                                      b.snap_sc[(size_t) il], b.c_snap[(size_t) il], b.c_rows[(size_t) il]};
+                if (bb[j] != nullptr) {
+                    const size_t sz = j == 5 ? (size_t) kWin * g.hd * 4 : fb;
+                    cudaMemcpy(aa[j], bb[j], sz, cudaMemcpyDeviceToDevice);
+                }
+            }
+        }
+        for (size_t si = 0; si < srcs.size(); ++si) {
+            const int64_t rows = (b.max_ctx + srcs[si].ratio - 1) / srcs[si].ratio + 1;
+            for (size_t di = 0; di < devs.size(); ++di) {
+                cudaSetDevice(devs[di].id);
+                if (b.src_ckv[si][di] != nullptr)
+                    cudaMemcpy(a.src_ckv[si][di], b.src_ckv[si][di], (size_t) rows * ckv_rb(),
+                               cudaMemcpyDeviceToDevice);
+                if (b.src_ik[si][di] != nullptr)
+                    cudaMemcpy(a.src_ik[si][di], b.src_ik[si][di], (size_t) rows * ik_rb(),
+                               cudaMemcpyDeviceToDevice);
+            }
+        }
+        a.hand = b.hand;
+        a.flag = b.flag;
+        a.last_p0 = -1;
+    }
+
+    void plan_window_seq(SeqState& q, int64_t p0, int T, WinPlan& wp) {
+        wp.par = false;
+        wp.async = par || (!sync_decode && T <= async_max_t);
+        wp.vl = 0;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            if (l.ratio > 0) {
+                const int R = l.ratio;
+                int n[kWin], k[kWin], clen_max = 0;
+                for (int t = 0; t < T; ++t) {
+                    n[t] = (int) ((p0 + t + 1) / R);
+                    k[t] = std::min(g.ix_topk, n[t]);
+                    clen_max = std::max(clen_max, n[t]);
+                }
+                if (l.ix_src) {
+                    for (int t = 0; t < T; ++t) wp.cand[il][t] = q.cur_cand_n[t];
+                    if (clen_max > 0 && l.cand_src)
+                        for (int t = 0; t < T; ++t)
+                            q.cur_cand_n[t] = std::min(g.cand_topk, (n[t] + g.cand_blk - 1) / g.cand_blk);
+                    for (int t = 0; t < T; ++t) q.cur_topk_n[t] = k[t];
+                }
+                for (int t = 0; t < T; ++t) wp.topk[il][t] = q.cur_topk_n[t];
+            }
+            wp.seq[il] = 0;
+            if (wp.async && !host_free(l)) {
+                wp.seq[il] = ++seq_issued;
+                layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
+            }
+        }
+    }
+
+    bool feed_prompt_seq(int s, const int* ids, int n, std::function<void(int64_t)> progress, std::string& err) {
+        SeqState& q = seqs[(size_t) s];
+        if (q.pos + n > q.max_ctx) { err = "the prompt is more than the sequence context"; return false; }
+        std::lock_guard<std::mutex> lk1(dev_mu[1]);
+        std::lock_guard<std::mutex> lk0(dev_mu[0]);
+        bind_all(q);
+        pos = q.pos;
+        toks = q.toks;
+        ctoks = q.ctoks;
+        slot_held = false;
+        if (!forward_chunks(ids, n, 0, err)) return false;
+        q.pos = pos;
+        q.toks = toks;
+        q.ctoks = ctoks;
+        for (int t = 0; t < kWin; ++t) {
+            q.cur_topk_n[t] = cur_topk_n[t];
+            q.cur_cand_n[t] = cur_cand_n[t];
+        }
+        progress(q.pos);
+        return true;
+    }
+
+    int feed_prompt_first(int s, const int* ids, int n, std::function<void(int64_t)> progress, const Sampling& smp,
+                          std::string& err) {
+        SeqState& q = seqs[(size_t) s];
+        if (q.pos + n > q.max_ctx) { err = "the prompt is more than the sequence context"; return -1; }
+        std::lock_guard<std::mutex> lk1(dev_mu[1]);
+        std::lock_guard<std::mutex> lk0(dev_mu[0]);
+        bind_all(q);
+        pos = q.pos;
+        toks = q.toks;
+        ctoks = q.ctoks;
+        slot_held = false;
+        if (!forward_chunks(ids, n, 1, err)) return -1;
+        q.pos = pos;
+        q.toks = toks;
+        q.ctoks = ctoks;
+        for (int t = 0; t < kWin; ++t) {
+            q.cur_topk_n[t] = cur_topk_n[t];
+            q.cur_cand_n[t] = cur_cand_n[t];
+        }
+        progress(q.pos);
+        return sample_seq_locked(q, smp, err);
+    }
+
+    bool decode_token0(int s, int64_t p0, std::string& err) {
+        SeqState& q = seqs[(size_t) s];
+        WinPlan wp;
+        plan_window_seq(q, p0, 1, wp);
+        wp.win = ++seq_item;
+        q.last_wp = wp;
+        q.last_p0 = p0;
+        std::lock_guard<std::mutex> lk(dev_mu[0]);
+        bind_dev(q, 0);
+        n_logits = 0;
+        return run_dev(0, p0, 1, wp, err, &q);
+    }
+
+    int decode_token1(int s, int64_t p0, const Sampling& smp, std::string& err) {
+        SeqState& q = seqs[(size_t) s];
+        if (q.last_p0 != p0) { err = "stage 1 has no plan for this token"; return -1; }
+        std::lock_guard<std::mutex> lk(dev_mu[1]);
+        bind_dev(q, 1);
+        n_logits = 1;
+        if (!run_dev(1, p0, 1, q.last_wp, err, &q)) return -1;
+        return sample_seq_locked(q, smp, err);
+    }
+
+    int sample_seq_locked(SeqState& q, const Sampling& smp, std::string& err) {
+        Dev& d = devs[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        strata::kernels::SamplerParams sp;
+        sp.temperature = smp.temperature;
+        sp.greedy = smp.temperature <= 0.0f;
+        sp.top_p = smp.top_p;
+        sp.top_k = smp.top_k;
+        sp.min_p = smp.min_p;
+        sp.seed = smp.seed;
+        sp.counter = smp.counter;
+        pen_n = smp.pen_n;
+        pen_repeat = smp.pen_repeat;
+        pen_freq = smp.pen_freq;
+        pen_present = smp.pen_present;
+        toks = q.toks;
+        int h = 0;
+        const int* hr = pen_rows((int64_t) q.toks.size(), 1, sp, h);
+        strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, hr, h,
+                                       sp, d.tok, d.st);
+        int t = -1;
+        cudaMemcpyAsync(&t, d.tok, 4, cudaMemcpyDeviceToHost, d.st);
+        cudaStreamSynchronize(d.st);
+        if (t < 0 || t >= g.vocab) { err = "the sampler returned no token"; return -1; }
+        q.toks.push_back(t);
+        q.ctoks.push_back(ctok(q.pos, t));
+        ++q.pos;
+        return t;
+    }
+
+    int sample_seq(int s, const Sampling& smp) {
+        std::lock_guard<std::mutex> lk(dev_mu[1]);
+        std::string err;
+        return sample_seq_locked(seqs[(size_t) s], smp, err);
+    }
+
+    int64_t seq_pos(int s) const { return seqs[(size_t) s].pos; }
+    const std::vector<int32_t>& seq_tokens(int s) const { return seqs[(size_t) s].toks; }
+    void seq_reset(int s) {
+        SeqState& q = seqs[(size_t) s];
+        std::lock_guard<std::mutex> lk1(dev_mu[1]);
+        std::lock_guard<std::mutex> lk0(dev_mu[0]);
+        q.pos = 0;
+        q.toks.clear();
+        q.ctoks.clear();
+        std::fill(q.cur_topk_n, q.cur_topk_n + kWin, 0);
+        std::fill(q.cur_cand_n, q.cur_cand_n + kWin, 0);
+        q.last_p0 = -1;
+        for (auto& h : q.hand) std::fill(h.begin(), h.end(), 0);
+        for (auto& f : q.flag) std::fill(f.begin(), f.end(), 0);
+        const size_t winb = (size_t) g.win * win_rb();
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            auto zero = [&](void* p, size_t bytes) {
+                if (p != nullptr) cudaMemsetAsync(p, 0, bytes, d.st);
+            };
+            zero(q.win[(size_t) il], winb);
+            zero(q.snap_win[(size_t) il], winb);
+            zero(q.ring_bak[(size_t) il], winb);
+            const size_t nf = (size_t) l.ratio * g.hd;
+            zero(q.c_kv[(size_t) il], nf * 4);
+            zero(q.c_score[(size_t) il], nf * 4);
+            zero(q.snap_kv[(size_t) il], nf * 4);
+            zero(q.snap_sc[(size_t) il], nf * 4);
+            zero(q.c_snap[(size_t) il], nf * 4);
+            zero(q.c_rows[(size_t) il], (size_t) kWin * g.hd * 4);
+        }
+        for (size_t si = 0; si < srcs.size(); ++si) {
+            const int64_t rows = (q.max_ctx + srcs[si].ratio - 1) / srcs[si].ratio + 1;
+            for (size_t di = 0; di < devs.size(); ++di) {
+                Dev& d = devs[di];
+                cudaSetDevice(d.id);
+                if (q.src_ckv[si][di] != nullptr)
+                    cudaMemsetAsync(q.src_ckv[si][di], 0, (size_t) rows * ckv_rb(), d.st);
+                if (q.src_ik[si][di] != nullptr)
+                    cudaMemsetAsync(q.src_ik[si][di], 0, (size_t) rows * ik_rb(), d.st);
+            }
+        }
+        for (size_t di = 0; di < devs.size(); ++di) cudaStreamSynchronize(devs[di].st);
+    }
+
     void save_profile() const {
         if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
             std::fprintf(stderr, "CPU lane: %ld calls, %.2f experts and %.2f rows a call; per call: gate/up %.3f ms, "
@@ -13410,6 +13789,25 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     return p_->slot_load(data, bytes, n_pos, err);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
+int Model::parallel() const { return p_->o.parallel; }
+bool Model::init_multi(int n, int64_t seq_ctx, std::string& err) { return p_->init_multi(n, seq_ctx, err); }
+int Model::seq_count() const { return p_->seq_n; }
+bool Model::feed_prompt_seq(int s, const int* ids, int n, std::function<void(int64_t)> progress, std::string& err) {
+    return p_->feed_prompt_seq(s, ids, n, std::move(progress), err);
+}
+int Model::feed_prompt_first(int s, const int* ids, int n, std::function<void(int64_t)> progress, const Sampling& smp,
+                             std::string& err) {
+    return p_->feed_prompt_first(s, ids, n, std::move(progress), smp, err);
+}
+bool Model::decode_token0(int s, int64_t p0, std::string& err) { return p_->decode_token0(s, p0, err); }
+int Model::decode_token1(int s, int64_t p0, const Sampling& smp, std::string& err) {
+    return p_->decode_token1(s, p0, smp, err);
+}
+int Model::sample_seq(int s, const Sampling& smp) { return p_->sample_seq(s, smp); }
+int64_t Model::seq_pos(int s) const { return p_->seq_pos(s); }
+const std::vector<int32_t>& Model::seq_tokens(int s) const { return p_->seq_tokens(s); }
+void Model::seq_reset(int s) { p_->seq_reset(s); }
+void Model::copy_seq(int dst, int src) { p_->copy_seq_state(dst, src); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 std::string Model::describe() const { return p_->describe(); }

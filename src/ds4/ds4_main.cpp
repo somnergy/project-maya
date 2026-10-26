@@ -35,6 +35,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,7 +91,7 @@ void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
+                 "           [--tp N] [--parallel N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
@@ -251,6 +252,7 @@ struct Req {
     // block still open after n tokens of the answer is closed - its next token is think_end - and the answer follows
     long long think_budget = 0;
     int think_end = -1;
+    int rid = -1;       // multi: this request's conversation id
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -354,8 +356,40 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "rid") r.rid = std::atoi(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
+}
+
+bool parse_decode(const std::string& line, Req& r) {
+    const char* p = line.c_str() + 7;   // "DECODE "
+    char* e = nullptr;
+    r.max_new = std::strtoll(p, &e, 10);
+    if (e == p) return false;
+    p = e;
+    for (;;) {
+        while (*p == ' ') ++p;
+        const char* s = p;
+        while (*p && *p != ' ') ++p;
+        if (p == s) break;
+        const std::string tok(s, (size_t) (p - s));
+        const size_t eq = tok.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
+        if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "top_k") r.top_k = std::atoi(v.c_str());
+        else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
+        else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
+        else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
+        else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
+        else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "ids") r.ids = parse_ids(v);
+    }
+    return r.max_new >= 0 && !r.ids.empty();
 }
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
@@ -744,6 +778,118 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     }
     while (in.next(line)) {
         if (line == "QUIT") break;
+        if (line == "RESET") {
+            m.reset();
+            held.clear();
+            slots.clear();
+            std::printf("RESET\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (line.rfind("FEED ", 0) == 0) {
+            std::vector<int> ids = parse_ids(line.substr(5));
+            if (ids.empty()) {
+                std::printf("ERR FEED needs ids\n"); std::fflush(stdout); continue;
+            }
+            m.begin_request();
+            const double t0 = now_ms();
+            const auto& st = m.tokens();
+            const size_t n_state = st.size();
+            size_t c = 0;
+            while (c < n_state && c < ids.size() && st[c] == ids[c]) ++c;
+            size_t from = 0;
+            bool took = false;
+            if (n_state > 0 && c == n_state && n_state < ids.size()) from = n_state;
+            else {
+                if (held.empty()) slot_put("");
+                const int64_t limit = (int64_t) std::min(c, ids.size() - 1);
+                const int64_t rs = m.restorable(limit);
+                bool whole = false;
+                const size_t back = slot_take(ids, rs > 0 ? (size_t) rs : 0, whole);
+                if (back > 0) { from = back; took = true; }
+                else if (rs >= 0 && m.restore(limit)) from = (size_t) m.pos();
+                else m.reset();
+            }
+            if (took) held.clear();
+            if ((long long) ids.size() > m.max_context()) {
+                std::printf("ERR FEED prompt %zu is more than the context %lld\n", ids.size(), (long long) m.max_context());
+                std::fflush(stdout); continue;
+            }
+            std::string err;
+            bool ok = true;
+            size_t done = from;
+            while (ok && done < ids.size()) {
+                if (in.stop.load()) break;
+                const size_t n = std::min<size_t>((size_t) m.feed_unit(), ids.size() - done);
+                if (done + n == ids.size())
+                    ok = m.feed_mark(ids.data() + done, (int) n, 0, 1, err);   // checkpoint before the last token
+                else
+                    ok = m.feed(ids.data() + done, (int) n, 0, err);
+                done += n;
+            }
+            m.set_cancel(nullptr);
+            m.set_images({});
+            if (!ok) {
+                std::printf("ERR FEED %s\n", err.c_str());
+                std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 0 0 0\n", ids.size(), now_ms() - t0);
+                m.reset(); held.clear();
+            } else {
+                m.checkpoint(0);
+                m.pin();
+                std::printf("FED %zu %zu %.1f\n", done, ids.size(), now_ms() - t0);
+                std::printf("DONE 0 %zu %.1f 0.0 length 0 0 0 0 0\n", ids.size(), now_ms() - t0);
+            }
+            std::fflush(stdout); continue;
+        }
+        if (line.rfind("DECODE ", 0) == 0) {
+            Req r;
+            if (!parse_decode(line, r)) {
+                std::printf("ERR expected: DECODE <max_new> [key=value ...] ids=<id,id,...>\n"); std::fflush(stdout); continue;
+            }
+            m.begin_request();
+            const auto& st = m.tokens();
+            size_t c = 0;
+            while (c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+            if (c < r.ids.size()) {
+                if (held.empty()) slot_put("");
+                const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
+                const int64_t rs = m.restorable(limit);
+                bool whole = false;
+                const size_t back = slot_take(r.ids, rs > 0 ? (size_t) rs : 0, whole);
+                if (back == 0) {
+                    std::printf("ERR DECODE conversation is not in the model and has no matching slot\n");
+                    std::fflush(stdout); continue;
+                }
+                held.clear();
+                if (back < r.ids.size()) {
+                    std::string err;
+                    if (!m.feed(r.ids.data() + back, (int) (r.ids.size() - back), 0, err)) {
+                        std::printf("ERR DECODE %s\n", err.c_str());
+                        std::fflush(stdout); continue;
+                    }
+                    m.checkpoint(0);
+                }
+            }
+            m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
+                            std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
+                            std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+            const double t0 = now_ms();
+            const long long limit = r.max_new;
+            int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
+            long long produced = 0;
+            const char* finish = "length";
+            for (;;) {
+                if (in.stop.load()) { finish = "cancel"; break; }
+                std::printf("T %d\n", tok); ++produced; std::fflush(stdout);
+                bool end = false;
+                for (int e : eos) end = end || tok == e;
+                if (end) { finish = "stop"; break; }
+                if (produced >= limit || m.pos() >= m.max_context()) break;
+                tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
+            }
+            std::printf("DONE %lld 0 %.1f 0.0 %s 0 0 0 0 0\n", produced, now_ms() - t0, finish);
+            std::fflush(stdout); continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
@@ -1105,6 +1251,366 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 
 }  // namespace
 
+int serve_multi(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
+                int N) {
+    std::vector<int> eos = parse_ids(eos_list);
+    for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), N);
+    std::fflush(stdout);
+    std::fprintf(stderr, "maya ds4 multi: GEN <max_new> [keys] rid=<id> <ids>; STOP <id>, QUIT\n");
+
+    std::mutex out_mu;
+    auto emit = [&](const std::string& s) {
+        std::lock_guard<std::mutex> lk(out_mu);
+        std::printf("%s\n", s.c_str());
+        std::fflush(stdout);
+    };
+
+    struct R {
+        int rid = -1, seq = -1;
+        long long max_new = 0, produced = 0;
+        int prompt_n = 0;
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 64;
+        unsigned long long seed = 0;
+        int pen_n = 0;
+        float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+        unsigned long long counter = 0;
+        bool done = false, cancel = false;
+        double start = 0, prompt_ms = 0, decode_start = 0;
+    };
+    std::vector<R> reqs((size_t) N);
+    std::vector<char> used((size_t) N, 0);
+    struct Item { int rid, seq; int64_t p0; };
+    std::deque<Item> q0, q1;
+    std::mutex qmu;
+    std::condition_variable cv0, cv1;
+    bool running = true;
+
+    auto add0 = [&](const Item& it) {
+        std::lock_guard<std::mutex> lk(qmu);
+        q0.push_back(it);
+        cv0.notify_one();
+    };
+
+    std::thread t0([&] {
+        while (true) {
+            Item it;
+            {
+                std::unique_lock<std::mutex> lk(qmu);
+                while (q0.empty() && running) cv0.wait(lk);
+                if (!running) break;
+                it = q0.front();
+                q0.pop_front();
+            }
+            R& r = reqs[(size_t) it.seq];
+            if (r.done || r.cancel) continue;
+            std::string err;
+            if (!m.decode_token0(it.seq, it.p0, err)) {
+                emit("ERR " + std::to_string(it.rid) + " " + err);
+                r.done = true;
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(qmu);
+                q1.push_back(it);
+                cv1.notify_one();
+            }
+        }
+    });
+
+    std::thread t1([&] {
+        while (true) {
+            Item it;
+            {
+                std::unique_lock<std::mutex> lk(qmu);
+                while (q1.empty() && running) cv1.wait(lk);
+                if (!running) break;
+                it = q1.front();
+                q1.pop_front();
+            }
+            R& r = reqs[(size_t) it.seq];
+            if (r.done || r.cancel) continue;
+            strata::ds4::Model::Sampling smp;
+            smp.temperature = r.temperature;
+            smp.top_p = r.top_p;
+            smp.min_p = r.min_p;
+            smp.top_k = r.top_k;
+            smp.seed = r.seed;
+            smp.counter = r.counter++;
+            smp.pen_n = r.pen_n;
+            smp.pen_repeat = r.pen_repeat;
+            smp.pen_freq = r.pen_freq;
+            smp.pen_present = r.pen_present;
+            std::string err;
+            int tok = m.decode_token1(it.seq, it.p0, smp, err);
+            if (tok < 0) {
+                emit("ERR " + std::to_string(it.rid) + " " + err);
+                r.done = true;
+                continue;
+            }
+            emit("T " + std::to_string(it.rid) + " " + std::to_string(tok));
+            ++r.produced;
+            bool end = false;
+            for (int e : eos) end = end || tok == e;
+            if (end || r.produced >= r.max_new || m.seq_pos(it.seq) >= m.max_context()) {
+                const double now = now_ms();
+                emit("DONE " + std::to_string(it.rid) + " " + std::to_string(r.produced) + " " +
+                     std::to_string(r.prompt_n) + " " + std::to_string(r.prompt_ms) + " " +
+                     std::to_string(now - r.decode_start) + " " + (end ? "stop" : "length") +
+                     " 0 0 0 0 0");
+                r.done = true;
+                continue;
+            }
+            add0({it.rid, it.seq, m.seq_pos(it.seq)});
+        }
+    });
+
+    Lines in;
+    in.start();
+
+    std::queue<std::string> cmds;
+    std::mutex cmd_mu;
+    std::condition_variable cmd_cv;
+    bool reader_done = false;
+    std::thread reader([&] {
+        std::string l;
+        while (in.next(l)) {
+            std::lock_guard<std::mutex> lk(cmd_mu);
+            cmds.push(l);
+            cmd_cv.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(cmd_mu);
+        reader_done = true;
+        cmd_cv.notify_one();
+    });
+
+    std::vector<Req> pend;
+    std::mutex batch_mu;
+
+    auto finish_first = [&](R& rr, const Req& r, int seq, int first) {
+        rr.prompt_ms = now_ms() - rr.start;
+        rr.decode_start = now_ms();
+        if (first < 0) {
+            emit("ERR " + std::to_string(r.rid) + " the prompt did not produce a first token");
+            rr.done = true;
+            return;
+        }
+        emit("T " + std::to_string(r.rid) + " " + std::to_string(first));
+        rr.produced = 1;
+        bool end = false;
+        for (int e : eos) end = end || first == e;
+        if (end || rr.produced >= rr.max_new || m.seq_pos(seq) >= m.max_context()) {
+            emit("DONE " + std::to_string(r.rid) + " " + std::to_string(rr.produced) + " " +
+                 std::to_string(rr.prompt_n) + " " + std::to_string(rr.prompt_ms) + " 0 " +
+                 (end ? "stop" : "length") + " 0 0 0 0 0");
+            rr.done = true;
+        } else {
+            add0({r.rid, seq, m.seq_pos(seq)});
+        }
+    };
+
+    auto process_pending = [&] {
+        std::lock_guard<std::mutex> bl(batch_mu);
+        if (pend.empty()) return;
+        std::vector<int> seq_of(pend.size(), -1);
+        std::vector<char> was_used(pend.size(), 0);
+        for (size_t i = 0; i < pend.size(); ++i) {
+            int seq = -1;
+            for (int s = 0; s < N; ++s)
+                if (!used[(size_t) s] || reqs[(size_t) s].done) { seq = s; break; }
+            if (seq < 0) {
+                emit("ERR " + std::to_string(pend[i].rid) + " no free sequence");
+                continue;
+            }
+            was_used[i] = used[(size_t) seq];
+            used[(size_t) seq] = 1;
+            seq_of[i] = seq;
+            R& rr = reqs[(size_t) seq];
+            rr = R{};
+            rr.rid = pend[i].rid;
+            rr.seq = seq;
+            rr.max_new = pend[i].max_new;
+            rr.prompt_n = (int) pend[i].ids.size();
+            rr.temperature = pend[i].temperature;
+            rr.top_p = pend[i].top_p;
+            rr.min_p = pend[i].min_p;
+            rr.top_k = pend[i].top_k;
+            rr.seed = pend[i].seed;
+            rr.pen_n = pend[i].pen_n < 0 ? INT_MAX : pend[i].pen_n;
+            rr.pen_repeat = std::isfinite(pend[i].pen_repeat) && pend[i].pen_repeat > 0.0f ? pend[i].pen_repeat : 1.0f;
+            rr.pen_freq = std::isfinite(pend[i].pen_freq) ? pend[i].pen_freq : 0.0f;
+            rr.pen_present = std::isfinite(pend[i].pen_present) ? pend[i].pen_present : 0.0f;
+            rr.start = now_ms();
+        }
+
+        size_t L = pend[0].ids.size();
+        for (const Req& p : pend) {
+            size_t m = std::min(L, p.ids.size());
+            size_t c = 0;
+            while (c < m && p.ids[c] == pend[0].ids[c]) ++c;
+            L = c;
+        }
+        bool share = pend.size() > 1 && L > 0;
+        for (const Req& p : pend)
+            if (L >= p.ids.size()) share = false;
+
+        auto setup_rr = [&](int i) {
+            R& rr = reqs[(size_t) seq_of[i]];
+            rr.start = now_ms();
+        };
+
+        std::string err;
+        if (share) {
+            const int s0 = seq_of[0];
+            if (was_used[0]) m.seq_reset(s0);
+            if (!m.feed_prompt_seq(s0, pend[0].ids.data(), (int) L, [](int64_t) {}, err)) {
+                emit("ERR " + std::to_string(pend[0].rid) + " " + err);
+                reqs[(size_t) s0].done = true;
+                pend.clear();
+                return;
+            }
+            for (size_t i = 1; i < pend.size(); ++i)
+                if (seq_of[i] >= 0) m.copy_seq(seq_of[i], s0);
+            for (size_t i = 0; i < pend.size(); ++i) {
+                const int seq = seq_of[i];
+                if (seq < 0) continue;
+                R& rr = reqs[(size_t) seq];
+                const int n = (int) pend[i].ids.size();
+                const int off = (int) L;
+                auto prog = [&](int64_t done) {
+                    const double ms = now_ms() - rr.start;
+                    emit("PP " + std::to_string(pend[i].rid) + " " + std::to_string(done) + " " +
+                         std::to_string(n) + " " + std::to_string(ms) + " " +
+                         std::to_string(done > 0 ? 1000.0 * (double) done / ms : 0.0) + " 0");
+                };
+                strata::ds4::Model::Sampling smp;
+                smp.temperature = rr.temperature;
+                smp.top_p = rr.top_p;
+                smp.min_p = rr.min_p;
+                smp.top_k = rr.top_k;
+                smp.seed = rr.seed;
+                smp.counter = rr.counter++;
+                smp.pen_n = rr.pen_n;
+                smp.pen_repeat = rr.pen_repeat;
+                smp.pen_freq = rr.pen_freq;
+                smp.pen_present = rr.pen_present;
+                if (rr.max_new > 0) {
+                    const int first = m.feed_prompt_first(seq, pend[i].ids.data() + off, n - off, prog, smp, err);
+                    finish_first(rr, pend[i], seq, first);
+                } else {
+                    if (!m.feed_prompt_seq(seq, pend[i].ids.data() + off, n - off, prog, err)) {
+                        emit("ERR " + std::to_string(pend[i].rid) + " " + err);
+                        rr.done = true;
+                        continue;
+                    }
+                    rr.prompt_ms = now_ms() - rr.start;
+                    rr.decode_start = now_ms();
+                    emit("DONE " + std::to_string(pend[i].rid) + " 0 " + std::to_string(rr.prompt_n) + " " +
+                         std::to_string(rr.prompt_ms) + " 0 length 0 0 0 0 0");
+                    rr.done = true;
+                }
+            }
+        } else {
+            for (size_t i = 0; i < pend.size(); ++i) {
+                const int seq = seq_of[i];
+                if (seq < 0) continue;
+                R& rr = reqs[(size_t) seq];
+                const int n = (int) pend[i].ids.size();
+                if (was_used[i]) m.seq_reset(seq);
+                auto prog = [&](int64_t done) {
+                    const double ms = now_ms() - rr.start;
+                    emit("PP " + std::to_string(pend[i].rid) + " " + std::to_string(done) + " " +
+                         std::to_string(n) + " " + std::to_string(ms) + " " +
+                         std::to_string(done > 0 ? 1000.0 * (double) done / ms : 0.0) + " 0");
+                };
+                strata::ds4::Model::Sampling smp;
+                smp.temperature = rr.temperature;
+                smp.top_p = rr.top_p;
+                smp.min_p = rr.min_p;
+                smp.top_k = rr.top_k;
+                smp.seed = rr.seed;
+                smp.counter = rr.counter++;
+                smp.pen_n = rr.pen_n;
+                smp.pen_repeat = rr.pen_repeat;
+                smp.pen_freq = rr.pen_freq;
+                smp.pen_present = rr.pen_present;
+                if (rr.max_new > 0) {
+                    const int first = m.feed_prompt_first(seq, pend[i].ids.data(), n, prog, smp, err);
+                    finish_first(rr, pend[i], seq, first);
+                } else {
+                    if (!m.feed_prompt_seq(seq, pend[i].ids.data(), n, prog, err)) {
+                        emit("ERR " + std::to_string(pend[i].rid) + " " + err);
+                        rr.done = true;
+                        continue;
+                    }
+                    rr.prompt_ms = now_ms() - rr.start;
+                    rr.decode_start = now_ms();
+                    emit("DONE " + std::to_string(pend[i].rid) + " 0 " + std::to_string(rr.prompt_n) + " " +
+                         std::to_string(rr.prompt_ms) + " 0 length 0 0 0 0 0");
+                    rr.done = true;
+                }
+            }
+        }
+        pend.clear();
+    };
+
+    std::thread flush([&] {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            if (!running) break;
+            process_pending();   // it takes batch_mu itself; locking it here first would deadlock
+        }
+    });
+
+    while (true) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(cmd_mu);
+            while (cmds.empty() && !reader_done) cmd_cv.wait(lk);
+            if (cmds.empty() && reader_done) break;
+            line = cmds.front();
+            cmds.pop();
+        }
+        if (line == "QUIT") break;
+        if (line.rfind("STOP ", 0) == 0) {
+            int rid = std::atoi(line.c_str() + 5);
+            for (R& r : reqs)
+                if (r.rid == rid) r.cancel = true;
+            continue;
+        }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            emit("ERR 0 unsupported command");
+            continue;
+        }
+        if (geni) {
+            emit("ERR 0 images are not supported by the multi prototype");
+            continue;
+        }
+        Req r;
+        if (!parse_gen(line, r, false) || r.rid < 0) {
+            emit("ERR 0 expected GEN <max_new> rid=<id> <ids>");
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> bl(batch_mu);
+            pend.push_back(r);
+        }
+        if (pend.size() >= (size_t) N) process_pending();
+    }
+
+    running = false;
+    {
+        std::lock_guard<std::mutex> lk(qmu);
+        cv0.notify_all();
+        cv1.notify_all();
+    }
+    if (t0.joinable()) t0.join();
+    if (t1.joinable()) t1.join();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
@@ -1162,6 +1668,7 @@ int main(int argc, char** argv) {
             o.dspark = v != "none";   // none: not even loaded
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
+        else if (a == "--parallel") o.parallel = std::max(1, std::atoi(val("--parallel").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
@@ -1209,7 +1716,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
+    if (serve_mode) {
+        if (o.parallel > 1) {
+            int64_t seq_ctx = std::min<int64_t>(o.max_context, 16384);
+            if (const char* v = std::getenv("STRATA_DS4_SEQ_CTX")) {
+                const int64_t n = std::atoll(v);
+                if (n > 0) seq_ctx = std::min<int64_t>(o.max_context, n);
+            }
+            if (!m.init_multi(o.parallel, seq_ctx, err)) {
+                std::fprintf(stderr, "maya-ds4 multi: %s\n", err.c_str());
+                return 1;
+            }
+            return serve_multi(m, eos, spec, o.dspark_conf, o.pack, o.parallel);
+        }
+        return serve(m, eos, spec, o.dspark_conf, o.pack);
+    }
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;
